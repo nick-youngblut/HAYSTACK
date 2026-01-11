@@ -168,6 +168,8 @@ from shared.models.runs import (
     RunStatusResponse,
     RunResultResponse,
     RunListResponse,
+    ControlStrategyValidationRequest,
+    ControlStrategyValidation,
 )
 from api.services.database import database
 from api.services.batch import batch_client
@@ -236,8 +238,27 @@ async def create_run(
         grounding_scores=[],
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
+        control_strategy=request.control_strategy,
+        control_strategy_effective=None,
         user_email=user_email,
     )
+
+
+@router.post("/validate-control-strategy", response_model=ControlStrategyValidation)
+async def validate_control_strategy(
+    request: ControlStrategyValidationRequest,
+):
+    """
+    Validate whether synthetic control strategy is possible for a query.
+    
+    Checks if matched control cells are available in the atlas for the
+    expected prompt cells. Useful for frontend to show warnings.
+    """
+    validation = await database.validate_control_strategy(
+        query=request.query,
+        control_strategy=request.control_strategy,
+    )
+    return validation
 
 
 @router.get("/{run_id}", response_model=RunStatusResponse)
@@ -332,6 +353,29 @@ async def cancel_run(run_id: str):
     return {"message": f"Run {run_id} cancelled"}
 ```
 
+Validation models used by the control strategy endpoint:
+
+```python
+# api/models/runs.py
+from shared.models.queries import ControlStrategy
+
+
+class ControlStrategyValidationRequest(BaseModel):
+    """Request to validate control strategy feasibility."""
+    query: str
+    control_strategy: ControlStrategy
+
+
+class ControlStrategyValidation(BaseModel):
+    """Result of control strategy validation."""
+    synthetic_control_available: bool
+    control_cells_found: int
+    control_donors: list[str]
+    control_conditions: list[str]
+    recommendation: ControlStrategy
+    warning: Optional[str]
+```
+
 ### 9.4 Batch Client (Cloud Run)
 
 The Cloud Run API uses this client to submit and cancel CPU orchestrator jobs.
@@ -376,12 +420,25 @@ class BatchClient:
             Batch job name for tracking/cancellation
         """
         job_name = f"haystack-orchestrator-{run_id}"
-        
+
+        # Extract control strategy for resource estimation
+        control_strategy = config.get("control_strategy", "synthetic_control")
+
+        # Estimate run duration based on control strategy
+        if control_strategy == "synthetic_control":
+            max_run_duration = "10800s"  # 3 hours
+        else:
+            max_run_duration = "7200s"  # 2 hours
+
         # Container configuration
         container = batch_v1.Runnable.Container(
             image_uri=settings.batch.orchestrator_image,
             commands=["python", "-m", "orchestrator.main"],
-            options=f"--env RUN_ID={run_id} --env USER_EMAIL={user_email}",
+            options=(
+                f"--env RUN_ID={run_id} "
+                f"--env USER_EMAIL={user_email} "
+                f"--env CONTROL_STRATEGY={control_strategy}"
+            ),
         )
         
         runnable = batch_v1.Runnable(container=container)
@@ -390,7 +447,7 @@ class BatchClient:
         task_spec = batch_v1.TaskSpec(
             runnables=[runnable],
             max_retry_count=0,  # No retries - let agent handle errors
-            max_run_duration="7200s",  # 2 hour max
+            max_run_duration=max_run_duration,
         )
         
         # Resource requirements (CPU only)

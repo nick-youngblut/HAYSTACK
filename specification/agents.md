@@ -63,6 +63,7 @@ TASK TYPES:
    - Prompts: Perturbed cells
    - Queries: Control cells (unperturbed)
    - Goal: Generate perturbed expression profiles
+   - Control strategy: Choose between synthetic control (paired prompts) or query-as-control (original query cells)
 
 2. OBSERVATIONAL ICL: Predict cell type expression in a specific donor/condition
    - Prompts: Cell types from target donor (the context you want to predict in)
@@ -76,9 +77,10 @@ TASK TYPES:
 
 Your workflow:
 1. UNDERSTAND: Parse the query to identify task type, cell type(s), and biological context
+   - Validate control strategy feasibility for perturbational tasks
 2. GENERATE: Create prompt candidates using appropriate strategies for the task type
 3. INFER: Run STACK inference with selected prompts
-4. EVALUATE: Assess biological grounding using task-appropriate metrics
+4. EVALUATE: Assess biological grounding using task-appropriate metrics and control strategy
 5. DECIDE: If score ≥ threshold OR max iterations reached → finalize; else → refine
 
 Key principles:
@@ -92,6 +94,10 @@ For OBSERVATIONAL tasks, focus on:
 - Finding reference donors with similar clinical profiles
 - Selecting high-quality reference cell populations
 - Evaluating cell type marker expression and tissue signatures
+
+For PERTURBATIONAL tasks:
+- Prefer synthetic_control when matched control prompts exist
+- If matched controls are unavailable, fall back to query_as_control and note confidence penalty
 ```
 
 ### 5.2 Query Understanding Subagent
@@ -360,6 +366,11 @@ Return a PromptConfiguration with:
 - Strategy used for each group
 - Combined relevance score
 - Rationale for selection
+
+If control_strategy is synthetic_control:
+- Identify matched control cells from the same donor/sample as the perturbed prompts
+- Populate paired_control_indices and paired_control_metadata
+- If no matched controls exist, signal fallback to query_as_control
 ```
 
 ### 5.4 Grounding Evaluation Subagent
@@ -409,6 +420,10 @@ OBSERVATIONAL:
 Compute a composite score and provide actionable feedback for improvement.
 
 Be critical but fair - novel predictions that make biological sense should not be penalized.
+
+For perturbational tasks:
+- Use control_strategy to interpret DE confidence (synthetic_control > query_as_control)
+- Apply a mild confidence penalty if query_as_control is used due to missing controls
 ```
 
 ---

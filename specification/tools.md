@@ -536,6 +536,7 @@ async def run_stack_inference(
 async def extract_de_genes(
     prediction_path: str,
     control_path: str,
+    control_strategy: ControlStrategy,
     lfc_threshold: float = 0.5,
     pval_threshold: float = 0.05,
 ) -> list[dict]:
@@ -545,6 +546,7 @@ async def extract_de_genes(
     Args:
         prediction_path: GCS path to prediction AnnData
         control_path: GCS path to control AnnData
+        control_strategy: Control strategy used for DE (synthetic or query-as-control)
         lfc_threshold: Minimum log2 fold change
         pval_threshold: Maximum adjusted p-value
     
@@ -582,6 +584,7 @@ async def compute_grounding_score(
     query: StructuredQuery,
     predictions: AnnData,
     control_or_reference: AnnData,
+    control_strategy: ControlStrategy | None = None,
 ) -> Union[GroundingScore, ObservationalGroundingScore]:
     """
     Compute composite biological grounding score.
@@ -590,6 +593,7 @@ async def compute_grounding_score(
         query: Parsed query with task type and priors
         predictions: Predicted AnnData
         control_or_reference: Control (perturbational) or reference (observational) AnnData
+        control_strategy: Optional control strategy to adjust confidence for perturbational tasks
     
     Returns:
         GroundingScore or ObservationalGroundingScore with component and composite scores
@@ -605,6 +609,7 @@ class GroundingEvaluator:
         query: StructuredQuery,
         predictions: AnnData,
         control_or_reference: AnnData,
+        control_strategy: ControlStrategy | None = None,
     ) -> Union[GroundingScore, ObservationalGroundingScore]:
         """
         Evaluate predictions based on task type.
@@ -613,7 +618,9 @@ class GroundingEvaluator:
             ICLTaskType.PERTURBATION_NOVEL_CELL_TYPES,
             ICLTaskType.PERTURBATION_NOVEL_SAMPLES,
         ]:
-            return await self._evaluate_perturbational(query, predictions, control_or_reference)
+            return await self._evaluate_perturbational(
+                query, predictions, control_or_reference, control_strategy
+            )
         return await self._evaluate_observational(query, predictions, control_or_reference)
     
     async def _evaluate_observational(

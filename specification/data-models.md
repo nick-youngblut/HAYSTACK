@@ -25,6 +25,11 @@ class ICLTaskType(str, Enum):
     DONOR_EXPRESSION_PREDICTION = "donor_expression_prediction"
     CROSS_DATASET_GENERATION = "cross_dataset_generation"
 
+class ControlStrategy(str, Enum):
+    """Strategy for computing differential expression in perturbational tasks."""
+    QUERY_AS_CONTROL = "query_as_control"
+    SYNTHETIC_CONTROL = "synthetic_control"
+
 
 class StructuredQuery(BaseModel):
     """Parsed representation of a user query."""
@@ -58,6 +63,21 @@ class StructuredQuery(BaseModel):
     expected_tissue_genes: list[str] = Field(default_factory=list)
     literature_context: Optional[str] = None
 
+    # Control strategy (perturbational tasks)
+    control_strategy: ControlStrategy = ControlStrategy.SYNTHETIC_CONTROL
+    control_cells_available: bool = Field(
+        default=False,
+        description="Whether matched control cells were found for synthetic control",
+    )
+    control_cell_info: Optional[dict] = Field(
+        default=None,
+        description="Metadata about matched control cells (donor, condition, count)",
+    )
+    control_strategy_fallback: Optional[ControlStrategy] = Field(
+        default=None,
+        description="If synthetic control unavailable, which strategy to use instead",
+    )
+
 
 class PromptCandidate(BaseModel):
     """A candidate prompt configuration."""
@@ -71,6 +91,16 @@ class PromptCandidate(BaseModel):
         "tissue_atlas",
     ]
     prompt_cell_indices: list[int] = Field(description="Selected cell indices for prompt")
+
+    # Paired control prompt for synthetic control strategy
+    paired_control_indices: Optional[list[int]] = Field(
+        default=None,
+        description="Matched control cell indices for synthetic control prompts",
+    )
+    paired_control_metadata: Optional[dict] = Field(
+        default=None,
+        description="Metadata for matched control cells (condition, donor, count)",
+    )
     
     # Metadata for ranking
     similarity_score: Optional[float] = None
@@ -131,9 +161,26 @@ class IterationRecord(BaseModel):
     selected_prompt: PromptCandidate
     grounding_score: Union[GroundingScore, ObservationalGroundingScore]
     duration_seconds: float
+
+    # Control strategy used
+    control_strategy: ControlStrategy = ControlStrategy.SYNTHETIC_CONTROL
     
     # Artifacts
     prediction_gcs_path: Optional[str] = None
+    control_prediction_gcs_path: Optional[str] = Field(
+        default=None,
+        description="GCS path to control prediction (synthetic control only)",
+    )
+    query_cells_gcs_path: Optional[str] = Field(
+        default=None,
+        description="GCS path to original query cells (query-as-control)",
+    )
+    de_analysis_metadata: Optional[dict] = Field(
+        default=None,
+        description=(
+            "DE metadata including treatment/control sources and cell counts"
+        ),
+    )
 
 
 class HaystackRun(BaseModel):
@@ -145,6 +192,9 @@ class HaystackRun(BaseModel):
     start_time: datetime
     end_time: Optional[datetime] = None
     status: Literal["running", "completed", "failed", "cancelled"]
+    control_strategy: ControlStrategy = ControlStrategy.SYNTHETIC_CONTROL
+    control_strategy_effective: Optional[ControlStrategy] = None
+    control_cells_available: bool = False
     
     # Configuration
     config: dict
@@ -183,12 +233,25 @@ class CreateRunRequest(BaseModel):
     """Request to create a new HAYSTACK run."""
     
     query: str = Field(description="Natural language query", min_length=10)
+
+    # Control strategy (perturbational tasks)
+    control_strategy: ControlStrategy = Field(
+        default=ControlStrategy.SYNTHETIC_CONTROL,
+        description=(
+            "Strategy for computing differential expression. "
+            "'synthetic_control' runs STACK twice with perturbed and control prompts. "
+            "'query_as_control' uses original query cells as baseline."
+        ),
+    )
     
     # Optional overrides
     max_iterations: Optional[int] = Field(default=None, ge=1, le=10)
     score_threshold: Optional[int] = Field(default=None, ge=1, le=10)
     llm_provider: Optional[Literal["anthropic", "openai", "google_genai"]] = None
     llm_model: Optional[str] = None
+    enable_literature_search: Optional[bool] = Field(default=True)
+    enable_pathway_enrichment: Optional[bool] = Field(default=True)
+    de_config: Optional["DEAnalysisConfig"] = None
     random_seed: Optional[int] = None
 
 
@@ -201,6 +264,10 @@ class RunStatusResponse(BaseModel):
     max_iterations: int
     current_score: Optional[int] = None
     message: str
+
+    # Control strategy info
+    control_strategy: Optional[ControlStrategy] = None
+    control_strategy_effective: Optional[ControlStrategy] = None
 
 
 class RunResultResponse(BaseModel):
@@ -248,6 +315,10 @@ class RunStatusResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     error_message: Optional[str] = None
+
+    # Control strategy info
+    control_strategy: Optional[ControlStrategy] = None
+    control_strategy_effective: Optional[ControlStrategy] = None
     
     # User info
     user_email: str
@@ -265,6 +336,18 @@ class EmailNotification(BaseModel):
 ### 4.3 Configuration Models
 
 ```python
+class DEAnalysisConfig(BaseModel):
+    """Configuration for differential expression analysis."""
+    
+    control_strategy: ControlStrategy = ControlStrategy.SYNTHETIC_CONTROL
+    lfc_threshold: float = Field(default=0.5, ge=0.0)
+    pval_threshold: float = Field(default=0.05, gt=0.0, le=1.0)
+    test_method: Literal["wilcoxon", "t-test", "edgeR", "DESeq2"] = "wilcoxon"
+    correction_method: Literal["benjamini-hochberg", "bonferroni"] = "benjamini-hochberg"
+    min_cells_per_group: int = Field(default=10, ge=1)
+    top_n_hvg: int = Field(default=2000, ge=100)
+
+
 class LLMConfig(BaseModel):
     """LLM backend configuration."""
     
@@ -286,6 +369,22 @@ class IterationConfig(BaseModel):
     score_threshold: int = 7  # 1-10 scale
     plateau_window: int = 3  # Stop if no improvement over N iterations
     min_improvement: int = 1  # Minimum score improvement to not count as plateau
+
+
+class RunConfig(BaseModel):
+    """Runtime configuration for a HAYSTACK run."""
+    
+    max_iterations: int = 5
+    score_threshold: int = 7
+    control_strategy: ControlStrategy = ControlStrategy.SYNTHETIC_CONTROL
+    require_matched_control: bool = Field(
+        default=True,
+        description="Require matched control cells for synthetic control prompts",
+    )
+    control_condition_names: list[str] = Field(
+        default_factory=lambda: ["PBS", "DMSO", "control", "vehicle", "untreated"],
+        description="Condition names to identify control cells in the atlas",
+    )
 
 
 class DatabaseConfig(BaseModel):

@@ -192,6 +192,9 @@ CREATE TABLE runs (
     run_id VARCHAR(64) PRIMARY KEY,
     user_email VARCHAR(256),
     status VARCHAR(32) NOT NULL,
+    control_strategy VARCHAR(32) DEFAULT 'synthetic_control',
+    control_strategy_effective VARCHAR(32),
+    control_cells_available BOOLEAN DEFAULT FALSE,
     
     raw_query TEXT NOT NULL,
     structured_query JSONB,
@@ -213,6 +216,14 @@ CREATE TABLE runs (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Iteration record structure (stored in runs.iterations JSONB)
+-- Each iteration includes:
+-- - prediction_gcs_path
+-- - control_prediction_gcs_path (synthetic control only)
+-- - query_cells_gcs_path (query-as-control only)
+-- - control_strategy
+-- - de_analysis_metadata
+
 -- Indexes for efficient querying
 CREATE INDEX idx_cells_dataset ON cells(dataset);
 CREATE INDEX idx_cells_cell_type ON cells(cell_type_cl_id);
@@ -225,6 +236,8 @@ CREATE INDEX idx_cells_condition ON cells(sample_condition);
 CREATE INDEX idx_cells_pert_ct_donor ON cells(perturbation_name, cell_type_cl_id, donor_id);
 CREATE INDEX idx_cells_tissue_ct ON cells(tissue_uberon_id, cell_type_cl_id);
 CREATE INDEX idx_cells_donor_ct ON cells(donor_id, cell_type_cl_id);
+
+CREATE INDEX idx_runs_control_strategy ON runs(control_strategy);
 
 CREATE INDEX idx_cell_types_lineage ON cell_types USING GIN(lineage_cl_ids);
 

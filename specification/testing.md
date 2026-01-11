@@ -138,6 +138,152 @@ def test_query_tool_returns_ranked_items(mocker):
     assert result["items"][0]["score"] >= result["items"][1]["score"]
 ```
 
+### 15.4 Control Strategy Tests
+
+```python
+# tests/test_control_strategy.py
+
+import pytest
+from shared.models.queries import ControlStrategy
+from orchestrator.agents.orchestrator import OrchestratorAgent
+
+
+class TestControlStrategy:
+    """Tests for control strategy handling."""
+    
+    @pytest.mark.asyncio
+    async def test_synthetic_control_with_matched_cells(
+        self, mock_database, mock_gcs
+    ):
+        """Test synthetic control when matched cells are available."""
+        mock_database.get_control_cells.return_value = {
+            "donor": "donor_1",
+            "condition": "PBS",
+            "cell_count": 100,
+        }
+        
+        agent = OrchestratorAgent(
+            run_id="test_123",
+            query="TGF-beta on fibroblasts",
+            config={"control_strategy": "synthetic_control"},
+        )
+        
+        result = await agent.run()
+        
+        assert mock_gcs.submit_inference_job.call_count == 2
+        assert result.control_strategy_effective == ControlStrategy.SYNTHETIC_CONTROL
+    
+    @pytest.mark.asyncio
+    async def test_synthetic_control_fallback_to_query(
+        self, mock_database, mock_gcs
+    ):
+        """Test fallback when no matched control cells available."""
+        mock_database.get_control_cells.return_value = None
+        
+        agent = OrchestratorAgent(
+            run_id="test_123",
+            query="TGF-beta on fibroblasts",
+            config={"control_strategy": "synthetic_control"},
+        )
+        
+        result = await agent.run()
+        
+        assert mock_gcs.submit_inference_job.call_count == 1
+        assert result.control_strategy_effective == ControlStrategy.QUERY_AS_CONTROL
+    
+    @pytest.mark.asyncio
+    async def test_query_as_control_direct(self, mock_database, mock_gcs):
+        """Test query-as-control when explicitly selected."""
+        agent = OrchestratorAgent(
+            run_id="test_123",
+            query="TGF-beta on fibroblasts",
+            config={"control_strategy": "query_as_control"},
+        )
+        
+        result = await agent.run()
+        
+        assert mock_gcs.submit_inference_job.call_count == 1
+        assert result.control_strategy_effective == ControlStrategy.QUERY_AS_CONTROL
+
+
+class TestDEAnalysis:
+    """Tests for differential expression with different control strategies."""
+    
+    @pytest.mark.asyncio
+    async def test_de_synthetic_control(self, mock_anndata):
+        """Test DE computation with synthetic control."""
+        from orchestrator.tools.inference_tools import extract_de_genes
+        
+        result = await extract_de_genes(
+            predictions=mock_anndata["perturbed"],
+            control=mock_anndata["synthetic_control"],
+            control_strategy=ControlStrategy.SYNTHETIC_CONTROL,
+        )
+        
+        assert result.control_type == "synthetic"
+        assert result.control_strategy == ControlStrategy.SYNTHETIC_CONTROL
+    
+    @pytest.mark.asyncio  
+    async def test_de_query_as_control(self, mock_anndata):
+        """Test DE computation with query as control."""
+        from orchestrator.tools.inference_tools import extract_de_genes
+        
+        result = await extract_de_genes(
+            predictions=mock_anndata["perturbed"],
+            control=mock_anndata["query_cells"],
+            control_strategy=ControlStrategy.QUERY_AS_CONTROL,
+        )
+        
+        assert result.control_type == "query"
+        assert result.control_strategy == ControlStrategy.QUERY_AS_CONTROL
+```
+
+```python
+# tests/integration/test_control_strategy_e2e.py
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_full_workflow_synthetic_control(test_client):
+    """End-to-end test with synthetic control strategy."""
+    response = await test_client.post("/api/v1/runs", json={
+        "query": "How would T cells respond to IL-6?",
+        "control_strategy": "synthetic_control",
+        "max_iterations": 1,
+    })
+    
+    assert response.status_code == 200
+    run_id = response.json()["run_id"]
+    
+    await wait_for_run(test_client, run_id, timeout=600)
+    
+    result = await test_client.get(f"/api/v1/runs/{run_id}/result")
+    assert result.json()["control_strategy_effective"] == "synthetic_control"
+    
+    iterations = result.json()["iterations"]
+    assert iterations[0]["control_prediction_path"] is not None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_full_workflow_query_as_control(test_client):
+    """End-to-end test with query-as-control strategy."""
+    response = await test_client.post("/api/v1/runs", json={
+        "query": "How would T cells respond to IL-6?",
+        "control_strategy": "query_as_control",
+        "max_iterations": 1,
+    })
+    
+    run_id = response.json()["run_id"]
+    await wait_for_run(test_client, run_id, timeout=300)
+    
+    result = await test_client.get(f"/api/v1/runs/{run_id}/result")
+    assert result.json()["control_strategy_effective"] == "query_as_control"
+    
+    iterations = result.json()["iterations"]
+    assert iterations[0]["control_prediction_path"] is None
+    assert iterations[0]["query_cells_path"] is not None
+```
+
 ```python
 # backend/tests/agents/test_agent_integration.py
 

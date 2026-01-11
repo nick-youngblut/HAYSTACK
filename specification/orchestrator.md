@@ -34,6 +34,7 @@ async def main():
     # Get run parameters from environment
     run_id = os.environ.get("RUN_ID")
     user_email = os.environ.get("USER_EMAIL")
+    env_control_strategy = os.environ.get("CONTROL_STRATEGY")
     
     if not run_id:
         logger.error("RUN_ID environment variable not set")
@@ -54,6 +55,10 @@ async def main():
         
         query = run["query"]
         config = run["config"]
+
+        if env_control_strategy:
+            # Allow Batch job environment to override config default
+            config["control_strategy"] = env_control_strategy
         
         # Update status to running
         await database.update_run(
@@ -170,6 +175,7 @@ class OrchestratorAgent:
         
         self.max_iterations = config.get("max_iterations", 5)
         self.score_threshold = config.get("score_threshold", 7)
+        self.control_strategy = config.get("control_strategy", "synthetic_control")
         
         # Initialize subagents
         self.query_agent = QueryUnderstandingAgent()
@@ -184,6 +190,23 @@ class OrchestratorAgent:
             await self._update_phase("query_analysis")
             
             structured_query = await self.query_agent.analyze(self.query)
+            structured_query.control_strategy = self.control_strategy
+
+            # Resolve control strategy feasibility
+            if self.control_strategy == "synthetic_control":
+                control_info = await self.prompt_agent.find_matched_controls(structured_query)
+                structured_query.control_cells_available = bool(control_info)
+                structured_query.control_cell_info = control_info
+                if not control_info:
+                    structured_query.control_strategy_fallback = "query_as_control"
+                    self.control_strategy = "query_as_control"
+            
+            await database.update_run(
+                run_id=self.run_id,
+                control_strategy=structured_query.control_strategy,
+                control_strategy_effective=self.control_strategy,
+                control_cells_available=structured_query.control_cells_available,
+            )
             
             # Iteration loop
             scores = []
@@ -205,7 +228,9 @@ class OrchestratorAgent:
                 
                 # Step 3: STACK inference (GPU Batch job)
                 await self._update_phase("inference", iteration)
-                predictions = await self._run_inference(iteration, prompt_cells)
+                predictions, control_predictions = await self._run_inference(
+                    iteration, prompt_cells, structured_query
+                )
                 
                 # Check for cancellation after long inference
                 if await self._is_cancelled():
@@ -215,6 +240,7 @@ class OrchestratorAgent:
                 await self._update_phase("evaluation", iteration)
                 eval_result = await self.evaluation_agent.evaluate(
                     predictions=predictions,
+                    control_predictions=control_predictions,
                     query=structured_query,
                 )
                 
@@ -273,8 +299,8 @@ class OrchestratorAgent:
             update["current_iteration"] = iteration
         await database.update_run(run_id=self.run_id, **update)
     
-    async def _run_inference(self, iteration: int, prompt_cells) -> "AnnData":
-        """Submit GPU Batch job for STACK inference."""
+    async def _run_inference(self, iteration: int, prompt_cells, structured_query) -> tuple:
+        """Submit GPU Batch job(s) for STACK inference."""
         # Write inputs to GCS
         gcs_prefix = f"batch-io/{self.run_id}/iter_{iteration}"
         await gcs_service.write_anndata(f"{gcs_prefix}/prompt.h5ad", prompt_cells)
@@ -286,9 +312,28 @@ class OrchestratorAgent:
             prompt_path=f"{gcs_prefix}/prompt.h5ad",
             output_path=f"{gcs_prefix}/predictions.h5ad",
         )
+
+        control_predictions_path = None
+        if self.control_strategy == "synthetic_control":
+            await gcs_service.write_anndata(
+                f"{gcs_prefix}/control_prompt.h5ad",
+                structured_query.control_cell_info["anndata"],
+            )
+            control_predictions_path = await gpu_batch_client.run_inference(
+                run_id=self.run_id,
+                iteration=iteration,
+                prompt_path=f"{gcs_prefix}/control_prompt.h5ad",
+                output_path=f"{gcs_prefix}/control_predictions.h5ad",
+            )
         
         # Read predictions from GCS
-        return await gcs_service.read_anndata(predictions_path)
+        predictions = await gcs_service.read_anndata(predictions_path)
+        control_predictions = (
+            await gcs_service.read_anndata(control_predictions_path)
+            if control_predictions_path
+            else None
+        )
+        return predictions, control_predictions
     
     async def _generate_outputs(self, predictions, scores) -> dict:
         """Generate final output files."""

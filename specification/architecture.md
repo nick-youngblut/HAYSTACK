@@ -129,6 +129,7 @@ This design ensures runs survive browser disconnects, Cloud Run scale-downs, and
 │  │    │ 2b. PROMPT GENERATION (per iteration)                           │   │    │
 │  │    │     • Run parallel retrieval strategies                         │   │    │
 │  │    │     • Rank and select prompt candidates                         │   │    │
+│  │    │     • [NEW] Identify matched control prompts (synthetic control) │   │    │
 │  │    │     • Update Cloud SQL: phase = "prompt_generation"             │   │    │
 │  │    └─────────────────────────────────────────────────────────────────┘   │    │
 │  │         │                                                                │    │
@@ -140,6 +141,7 @@ This design ensures runs survive browser disconnects, Cloud Run scale-downs, and
 │  │    │     • Submit GPU Batch job                                      │   │    │
 │  │    │     • Poll for completion (10s intervals)                       │   │    │
 │  │    │     • Read predictions from GCS                                 │   │    │
+│  │    │     • Synthetic control: run 2x (perturbed + control)           │   │    │
 │  │    │     • Update Cloud SQL: phase = "inference"                     │   │    │
 │  │    └─────────────────────────────────────────────────────────────────┘   │    │
 │  │         │                                                                │    │
@@ -147,9 +149,11 @@ This design ensures runs survive browser disconnects, Cloud Run scale-downs, and
 │  │    ┌─────────────────────────────────────────────────────────────────┐   │    │
 │  │    │ 2d. GROUNDING EVALUATION                                        │   │    │
 │  │    │     • Extract DE genes from predictions                         │   │    │
+│  │    │     • Apply control strategy-aware DE analysis                  │   │    │
 │  │    │     • Run pathway enrichment (GO, KEGG, Reactome)               │   │    │
 │  │    │     • Check literature support via PubMed/Semantic Scholar      │   │    │
 │  │    │     • Compute grounding score (1-10)                            │   │    │
+│  │    │     • Apply confidence factor based on control strategy         │   │    │
 │  │    │     • Update Cloud SQL: phase = "evaluation", scores            │   │    │
 │  │    └─────────────────────────────────────────────────────────────────┘   │    │
 │  │         │                                                                │    │
@@ -196,6 +200,8 @@ This design ensures runs survive browser disconnects, Cloud Run scale-downs, and
 │  │  • current_phase: "query_analysis" | "prompt_generation" |              │    │
 │  │                   "inference" | "evaluation" | "output_generation"      │    │
 │  │  • grounding_scores: [7, 8, ...]  (per iteration)                       │    │
+│  │  • control_strategy: "synthetic_control" | "query_as_control"           │    │
+│  │  • control_strategy_effective: actual strategy used (fallback aware)    │    │
 │  │  • error_message: string (if failed)                                    │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │       │                                                                         │
@@ -293,18 +299,26 @@ This design ensures runs survive browser disconnects, Cloud Run scale-downs, and
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
-COST EFFICIENCY:
-┌────────────────────┬─────────────────┬──────────────────────────────────────────┐
-│ Component          │ Hourly Cost     │ Usage Pattern                            │
-├────────────────────┼─────────────────┼──────────────────────────────────────────┤
-│ CPU Orchestrator   │ ~$0.13/hr       │ Runs for entire workflow (10-30 min)     │
-│ (e2-standard-4)    │                 │ Active during LLM calls, DB queries      │
-├────────────────────┼─────────────────┼──────────────────────────────────────────┤
-│ GPU Inference      │ ~$3.00/hr       │ Only during STACK inference (~2-5 min    │
-│ (A100 80GB)        │                 │ per iteration, 1-5 iterations)           │
-├────────────────────┼─────────────────┼──────────────────────────────────────────┤
-│ Cloud Run          │ ~$0.00024/req   │ Minimal: job submission + status polls   │
-└────────────────────┴─────────────────┴──────────────────────────────────────────┘
+COST EFFICIENCY (UPDATED):
+┌────────────────────┬─────────────────────┬──────────────────────────────────────────────┐
+│ Component          │ Hourly Cost         │ Usage Pattern                                │
+├────────────────────┼─────────────────────┼──────────────────────────────────────────────┤
+│ CPU Orchestrator   │ ~$0.13/hr           │ Runs for entire workflow (10-30 min)         │
+│ (e2-standard-4)    │                     │ Active during LLM calls, DB queries          │
+├────────────────────┼─────────────────────┼──────────────────────────────────────────────┤
+│ GPU Inference      │ ~$3.00/hr           │ Query-as-Control: ~2-5 min/iteration         │
+│ (A100 80GB)        │                     │ Synthetic Control: ~4-10 min/iteration (2x)  │
+├────────────────────┼─────────────────────┼──────────────────────────────────────────────┤
+│ Cloud Run          │ ~$0.00024/req       │ Minimal: job submission + status polls       │
+└────────────────────┴─────────────────────┴──────────────────────────────────────────────┘
+
+ESTIMATED COST PER RUN (NEW):
+┌─────────────────────┬───────────────────┬───────────────────┐
+│ Control Strategy    │ 1 Iteration       │ 5 Iterations      │
+├─────────────────────┼───────────────────┼───────────────────┤
+│ Query-as-Control    │ ~$0.30            │ ~$1.25            │
+│ Synthetic Control   │ ~$0.55            │ ~$2.25            │
+└─────────────────────┴───────────────────┴───────────────────┘
 ```
 
 ### 3.5 State Management

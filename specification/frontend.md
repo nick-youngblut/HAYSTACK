@@ -65,14 +65,68 @@ frontend/
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { useMutation } from "@tanstack/react-query";
-import { createRun } from "@/lib/api/runs";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { createRun, validateControlStrategy } from "@/lib/api/runs";
 import { Button } from "@/components/ui/Button";
+import { RadioGroup } from "@/components/ui/RadioGroup";
+import { Tooltip } from "@/components/ui/Tooltip";
+import { AlertCircle, Info } from "lucide-react";
+
+type ControlStrategy = "query_as_control" | "synthetic_control";
+
+interface ControlStrategyOption {
+  value: ControlStrategy;
+  label: string;
+  description: string;
+  pros: string[];
+  cons: string[];
+}
+
+const CONTROL_STRATEGIES: ControlStrategyOption[] = [
+  {
+    value: "synthetic_control",
+    label: "Synthetic Control (Recommended)",
+    description:
+      "Run STACK twice with perturbed and control prompts, then compute differential expression between the two predictions.",
+    pros: [
+      "Controls for systematic prompting artifacts",
+      "Matches STACK paper methodology",
+      "More rigorous for publication-quality results",
+    ],
+    cons: [
+      "Requires ~2x inference time",
+      "Requires control cells from same sample",
+    ],
+  },
+  {
+    value: "query_as_control",
+    label: "Query as Control",
+    description:
+      "Use original unperturbed query cells as the control baseline for differential expression.",
+    pros: [
+      "Faster (single STACK inference)",
+      "Works when control prompts unavailable",
+    ],
+    cons: [
+      "May include prompting artifacts in DE results",
+      "Less rigorous for benchmarking",
+    ],
+  },
+];
 
 export function RunForm() {
   const router = useRouter();
   const [query, setQuery] = useState("");
+  const [controlStrategy, setControlStrategy] =
+    useState<ControlStrategy>("synthetic_control");
   
+  const validationQuery = useQuery({
+    queryKey: ["validate-control-strategy", query, controlStrategy],
+    queryFn: () => validateControlStrategy({ query, control_strategy: controlStrategy }),
+    enabled: query.length >= 10 && controlStrategy === "synthetic_control",
+    staleTime: 30000,
+  });
+
   const mutation = useMutation({
     mutationFn: createRun,
     onSuccess: (data) => {
@@ -82,11 +136,19 @@ export function RunForm() {
   
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    mutation.mutate({ query });
+    mutation.mutate({
+      query,
+      control_strategy: controlStrategy,
+    });
   };
+
+  const showControlWarning =
+    controlStrategy === "synthetic_control" &&
+    validationQuery.data &&
+    !validationQuery.data.synthetic_control_available;
   
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
+    <form onSubmit={handleSubmit} className="space-y-6">
       <div>
         <label className="block text-sm font-medium text-gray-700">
           Describe your perturbation prediction task
@@ -98,6 +160,87 @@ export function RunForm() {
           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm"
           rows={4}
         />
+      </div>
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <label className="block text-sm font-medium text-gray-700">
+            Control Strategy for Differential Expression
+          </label>
+          <Tooltip content="Determines how log2 fold changes are calculated">
+            <Info className="h-4 w-4 text-gray-400" />
+          </Tooltip>
+        </div>
+
+        <RadioGroup
+          value={controlStrategy}
+          onChange={(value) => setControlStrategy(value as ControlStrategy)}
+          className="space-y-3"
+        >
+          {CONTROL_STRATEGIES.map((option) => (
+            <RadioGroup.Option
+              key={option.value}
+              value={option.value}
+              className={({ checked }) =>
+                `relative flex cursor-pointer rounded-lg border p-4 ${
+                  checked
+                    ? "border-blue-500 bg-blue-50"
+                    : "border-gray-200 bg-white"
+                }`
+              }
+            >
+              {({ checked }) => (
+                <div className="flex w-full items-start">
+                  <div className="flex-1">
+                    <div className="flex items-center">
+                      <span
+                        className={`text-sm font-medium ${
+                          checked ? "text-blue-900" : "text-gray-900"
+                        }`}
+                      >
+                        {option.label}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-sm text-gray-500">
+                      {option.description}
+                    </p>
+                    
+                    {checked && (
+                      <div className="mt-3 grid grid-cols-2 gap-4 text-xs">
+                        <div>
+                          <span className="font-medium text-green-700">Pros:</span>
+                          <ul className="mt-1 list-disc pl-4 text-green-600">
+                            {option.pros.map((pro, i) => (
+                              <li key={i}>{pro}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div>
+                          <span className="font-medium text-amber-700">Cons:</span>
+                          <ul className="mt-1 list-disc pl-4 text-amber-600">
+                            {option.cons.map((con, i) => (
+                              <li key={i}>{con}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </RadioGroup.Option>
+          ))}
+        </RadioGroup>
+
+        {showControlWarning && (
+          <div className="flex items-start space-x-2 rounded-md border border-amber-200 bg-amber-50 p-3">
+            <AlertCircle className="mt-0.5 h-4 w-4 text-amber-600" />
+            <div className="text-sm text-amber-800">
+              Matched control cells were not found for your query. We recommend
+              switching to "Query as Control" or proceeding with fallback.
+            </div>
+          </div>
+        )}
       </div>
       
       <Button
@@ -223,6 +366,8 @@ export function useRunPolling(
     currentPhase: run?.current_phase,
     groundingScores: run?.grounding_scores ?? [],
     errorMessage: run?.error_message,
+    controlStrategy: run?.control_strategy,
+    controlStrategyEffective: run?.control_strategy_effective,
     
     // Derived state
     isFinished: ["completed", "failed", "cancelled"].includes(run?.status ?? ""),
@@ -275,6 +420,8 @@ export function RunStatus({ runId }: RunStatusProps) {
     isRunning,
     isFinished,
     latestScore,
+    controlStrategy,
+    controlStrategyEffective,
   } = useRunPolling(runId);
 
   const cancelMutation = useMutation({
@@ -332,6 +479,22 @@ export function RunStatus({ runId }: RunStatusProps) {
             max={maxIterations}
             phase={currentPhase}
           />
+        </div>
+      )}
+
+      {(controlStrategy || controlStrategyEffective) && (
+        <div className="text-sm text-gray-600">
+          Control strategy:{" "}
+          <span className="font-medium text-gray-800">
+            {controlStrategyEffective ?? controlStrategy}
+          </span>
+          {controlStrategy &&
+            controlStrategyEffective &&
+            controlStrategy !== controlStrategyEffective && (
+              <span className="ml-2 text-amber-700">
+                (fallback from {controlStrategy})
+              </span>
+            )}
         </div>
       )}
 
