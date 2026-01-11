@@ -17,69 +17,81 @@ The system transforms STACK from an open-loop tool (manual prompt selection → 
 
 ## Architecture
 
+HAYSTACK uses a **two-tier GCP Batch architecture** for robust, long-running agentic workflows:
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           Google Cloud Run                                       │
-│                         (Single Container)                                       │
+│                    Google Cloud Run (Thin API Layer)                            │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                  │
 │  ┌────────────────────────────────────────────────────────────────────────────┐ │
 │  │                    FastAPI Backend (port 8080)                             │ │
 │  │                                                                            │ │
-│  │   /api/v1/runs/*     → Run management (create, status, results)           │ │
-│  │   /api/v1/cells/*    → Cell metadata browsing                             │ │
-│  │   /api/v1/metadata/* → Perturbations, cell types lookup                   │ │
-│  │   /*                 → Static files (Next.js build)                       │ │
-│  │                                                                            │ │
-│  │   ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐           │ │
-│  │   │  Orchestrator   │  │  Batch Client   │  │  Grounding      │           │ │
-│  │   │  Agent          │──│  (submits jobs) │──│  Evaluator      │           │ │
-│  │   └─────────────────┘  └─────────────────┘  └─────────────────┘           │ │
-│  │           │                                                                │ │
-│  │   ┌───────┴────────┬─────────────────┬──────────────────┐                 │ │
-│  │   ▼                ▼                 ▼                  ▼                 │ │
-│  │   Query        Retrieval         Knowledge         Evaluation            │ │
-│  │   Analyzer     Subagent          Subagent          Subagent              │ │
-│  │                                                                            │ │
+│  │   POST /api/v1/runs/     → Submit CPU Batch job, return run_id            │ │
+│  │   GET  /api/v1/runs/{id} → Read status from Cloud SQL                     │ │
+│  │   POST /api/v1/runs/{id}/cancel → Cancel Batch job                        │ │
+│  │   /*                     → Static files (Next.js)                         │ │
 │  └────────────────────────────────────────────────────────────────────────────┘ │
 │                                                                                  │
 │  ┌────────────────────────────────────────────────────────────────────────────┐ │
 │  │                    Next.js Frontend (Static Export)                        │ │
-│  │                                                                            │ │
-│  │   • Query input interface                                                  │ │
-│  │   • Status polling (15s interval)                                          │ │
-│  │   • Results visualization                                                  │ │
-│  │   • Run history                                                            │ │
+│  │   • Query input, status polling (15s), results visualization              │ │
 │  └────────────────────────────────────────────────────────────────────────────┘ │
 │                                                                                  │
-└──────────────────────────────────┬───────────────────────────────────────────────┘
-                                   │
-          ┌────────────────────────┼────────────────────────┬───────────────────────┐
-          ▼                        ▼                        ▼                       ▼
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│   Cloud SQL      │    │   GCS Buckets    │    │  GCP Batch       │    │  External APIs   │
-│   (PostgreSQL    │    │                  │    │  (STACK GPU)     │    │                  │
-│    + pgvector)   │    │  • Atlas H5ADs   │    │                  │    │  • KEGG          │
-│                  │    │  • STACK models  │    │  • A100 80GB     │    │  • Reactome      │
-│  • Cell metadata │    │  • Results       │    │  • Inference     │    │  • UniProt       │
-│  • Embeddings    │    │  • Batch I/O     │    │    container     │    │  • PubMed        │
-│  • Run history   │    │                  │    │                  │    │  • Ensembl       │
-└──────────────────┘    └──────────────────┘    └──────────────────┘    └──────────────────┘
+└──────────────────────────────────────┬──────────────────────────────────────────┘
+                                       │ Submits Batch job
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    GCP Batch — CPU Orchestrator Job                             │
+│                    e2-standard-4 (~$0.13/hr)                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│   • Query understanding (LLM calls)                                             │
+│   • Prompt generation (LLM + DB queries)                                        │
+│   • Grounding evaluation (external APIs + LLM)                                  │
+│   • Iteration control, updates Cloud SQL status                                 │
+│   • Submits GPU Batch jobs for STACK inference                                  │
+│   • Sends email notification on completion                                      │
+└──────────────────────────────────────┬──────────────────────────────────────────┘
+                                       │ Submits GPU job per iteration
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    GCP Batch — GPU Inference Job                                │
+│                    a2-highgpu-1g / NVIDIA A100 80GB (~$3/hr)                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│   • Load STACK model, run inference (T=5), write predictions to GCS            │
+└─────────────────────────────────────────────────────────────────────────────────┘
+          │                             │                             │
+          ▼                             ▼                             ▼
+┌──────────────────┐         ┌──────────────────┐         ┌──────────────────┐
+│   Cloud SQL      │         │   GCS Buckets    │         │  External APIs   │
+│   (PostgreSQL    │         │   • Atlas H5ADs  │         │  • LLM Providers │
+│    + pgvector)   │         │   • STACK model  │         │  • KEGG/Reactome │
+│   • Run status   │         │   • Batch I/O    │         │  • SendGrid      │
+└──────────────────┘         └──────────────────┘         └──────────────────┘
 ```
+
+**Benefits of this architecture:**
+- Runs survive browser disconnects and Cloud Run scale-downs
+- Users can launch multiple parallel runs
+- No Cloud Run timeout concerns (60-min limit)
+- Cost-efficient: GPU only used during actual inference
 
 ## Technology Stack
 
-### Backend
-- **FastAPI** — Async web framework serving API + static files
+### Cloud Run (API Layer)
+- **FastAPI** — Thin API layer for job submission + status queries
+- **asyncpg** — PostgreSQL async driver for status reads
+- **GCP Batch Client** — Submits orchestrator jobs
+
+### CPU Batch (Orchestrator)
 - **LangChain + LangGraph** — Agent orchestration and tool management
 - **asyncpg + pgvector** — PostgreSQL async driver with vector similarity
 - **Cloud SQL Python Connector** — Secure Cloud SQL connections
-- **GCP Batch Client** — Submits and monitors GPU inference jobs
 - **SendGrid** — Email notifications on run completion
 - **Dynaconf** — Environment-based configuration
 - **Scanpy/AnnData** — Single-cell data processing
 
-### STACK Inference (GCP Batch)
+### GPU Batch (STACK Inference)
 - **NVIDIA A100 80GB** — GPU for model inference
 - **PyTorch + STACK** — Foundation model inference
 - **Separate container** — Built from STACK repo with PyTorch base
@@ -92,8 +104,9 @@ The system transforms STACK from an open-loop tool (manual prompt selection → 
 - **Tailwind CSS + Headless UI** — Styling and components
 
 ### Infrastructure
-- **Google Cloud Run** — Web application hosting (us-east1)
-- **GCP Batch** — GPU compute for STACK inference (us-east1)
+- **Google Cloud Run** — API hosting (us-east1)
+- **GCP Batch (CPU)** — Orchestrator agent jobs (us-east1)
+- **GCP Batch (GPU)** — STACK inference jobs (us-east1)
 - **GCP Cloud SQL** — PostgreSQL 15 with pgvector extension
 - **Google Cloud Storage** — Atlas data, models, results, Batch I/O
 - **GCP IAP** — Authentication (provides user email)
@@ -120,59 +133,54 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ```
 haystack/
-├── backend/
-│   ├── api/
-│   │   └── routes/          # FastAPI route handlers
-│   │       ├── runs.py      # Run management endpoints
-│   │       ├── cells.py     # Cell browsing endpoints
-│   │       ├── metadata.py  # Lookup table endpoints
-│   │       └── health.py    # Health check endpoint
-│   ├── agents/
-│   │   ├── orchestrator.py  # Main orchestrator agent
-│   │   ├── query_analyzer.py
-│   │   ├── retrieval.py
-│   │   ├── knowledge.py
-│   │   └── evaluation.py
-│   ├── models/              # Pydantic schemas
-│   │   ├── queries.py
-│   │   ├── runs.py
-│   │   ├── cells.py
-│   │   └── notifications.py
+├── api/                         # Cloud Run API (thin layer)
+│   ├── routes/
+│   │   ├── runs.py              # Run management (submit, status, cancel)
+│   │   ├── cells.py             # Cell browsing
+│   │   └── health.py            # Health check
 │   ├── services/
-│   │   ├── database.py      # Cloud SQL client
-│   │   ├── batch.py         # GCP Batch client
-│   │   ├── email.py         # SendGrid email service
-│   │   ├── retrieval/       # Cell retrieval strategies
-│   │   ├── grounding.py     # Biological grounding evaluation
-│   │   └── external/        # KEGG, Reactome, UniProt clients
-│   ├── workers/
-│   │   └── run_worker.py    # Background run execution
-│   ├── utils/
-│   ├── tests/
-│   ├── main.py              # FastAPI app factory
-│   ├── settings.yml         # Dynaconf configuration
-│   └── pyproject.toml
+│   │   ├── database.py          # Cloud SQL client (read status)
+│   │   └── batch.py             # Batch job submission
+│   ├── main.py                  # FastAPI app
+│   └── config.py                # API configuration
+│
+├── orchestrator/                # CPU Batch job (agent workflow)
+│   ├── agents/
+│   │   ├── orchestrator.py      # Main orchestrator loop
+│   │   ├── query_understanding.py
+│   │   ├── prompt_generation.py
+│   │   └── grounding_evaluation.py
+│   ├── services/
+│   │   ├── database.py          # Cloud SQL client (update status)
+│   │   ├── batch.py             # GPU Batch job submission
+│   │   ├── email.py             # SendGrid notifications
+│   │   └── biological_apis.py   # KEGG, Reactome, etc.
+│   ├── tools/                   # LangChain tools
+│   └── main.py                  # Batch job entrypoint
+│
+├── inference/                   # GPU Batch job (STACK only)
+│   └── run_inference.py         # STACK inference script
+│
+├── shared/                      # Shared code
+│   └── models/                  # Pydantic schemas
+│
 ├── frontend/
-│   ├── app/                 # Next.js App Router pages
-│   ├── components/          # React components
-│   ├── hooks/               # Custom React hooks (polling)
-│   ├── lib/                 # API client, utilities
-│   ├── stores/              # Zustand stores
-│   ├── types/               # TypeScript interfaces
-│   ├── package.json
-│   ├── next.config.js
-│   ├── tailwind.config.js
-│   └── tsconfig.json
-├── specification/           # Design documents
-│   ├── overview.md
-│   ├── prompt-retrieval.md
-│   └── README.md
-├── scripts/
-│   ├── build_index.py       # Index building pipeline
-│   └── seed_db.py           # Development data seeding
-├── Dockerfile
-├── docker-compose.yml       # Local development
-├── cloudbuild.yaml          # CI/CD configuration
+│   ├── app/                     # Next.js App Router pages
+│   ├── components/              # React components
+│   ├── hooks/                   # Custom React hooks (polling)
+│   ├── lib/                     # API client, utilities
+│   └── ...
+│
+├── docker/
+│   ├── Dockerfile.api           # Cloud Run container
+│   ├── Dockerfile.orchestrator  # CPU Batch container
+│   └── Dockerfile.inference     # GPU Batch container
+│
+├── specification/               # Design documents
+├── scripts/                     # Build/seed scripts
+├── docker-compose.yml           # Local development
+├── cloudbuild.yaml              # CI/CD configuration
+├── pyproject.toml               # Python dependencies
 └── README.md
 ```
 

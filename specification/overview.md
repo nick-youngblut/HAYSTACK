@@ -97,60 +97,90 @@ HAYSTACK is deployed as a **FastAPI backend + Next.js frontend** web application
 
 ### 3.1 High-Level Architecture
 
+HAYSTACK uses a **two-tier GCP Batch architecture** for robust, long-running agentic workflows:
+
+1. **Cloud Run** — Thin API layer for job submission, status queries, and frontend serving
+2. **CPU Batch Job** — Orchestrator agent running the iterative optimization loop
+3. **GPU Batch Job** — STACK inference only (submitted by the orchestrator)
+
+This design ensures runs survive browser disconnects, Cloud Run scale-downs, and enables parallel runs per user.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           Google Cloud Run                                      │
-│                         (Single Container)                                      │
+│                    Google Cloud Run (Thin API Layer)                            │
+│                         us-east1                                                │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  ┌──────────────────────────────────────────────────────────────────────────┐   │
 │  │                    FastAPI Backend (uvicorn on port 8080)                │   │
 │  │                                                                          │   │
-│  │   Route Priority:                                                        │   │
-│  │   1. /api/v1/* → REST API Routes (runs, cells, metadata)                 │   │
-│  │   2. /*        → Static Files (/app/frontend/out)                        │   │
-│  │   3. 404       → index.html (SPA routing)                                │   │
+│  │   POST /api/v1/runs/        → Submit CPU Batch job, return run_id        │   │
+│  │   GET  /api/v1/runs/{id}    → Read status from Cloud SQL                 │   │
+│  │   POST /api/v1/runs/{id}/cancel → Cancel Batch job via API               │   │
+│  │   GET  /api/v1/runs/{id}/result → Return signed GCS URLs                 │   │
+│  │   GET  /api/v1/cells/*      → Cell metadata browsing                     │   │
+│  │   GET  /api/v1/metadata/*   → Lookup tables                              │   │
+│  │   /*                        → Static files (Next.js)                     │   │
 │  └──────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
 │  ┌──────────────────────────────────────────────────────────────────────────┐   │
 │  │                 Next.js Frontend (Static Export)                         │   │
-│  │   - App Router                                                           │   │
-│  │   - TypeScript                                                           │   │
-│  │   - Tailwind CSS                                                         │   │
 │  │   - TanStack Query (polling for status updates)                          │   │
 │  │   - Zustand (state management)                                           │   │
 │  └──────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
-└───────────┬────────────────────┬──────────────────────┬─────────────────────────┘
-            │                    │                      │                    
-            ▼                    ▼                      ▼                    
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────────────┐
-│  GCP Cloud SQL   │  │  GCS Bucket      │  │  GCP Batch (STACK Inference)         │
-│  (PostgreSQL +   │  │  (Atlas H5AD,    │  │                                      │
-│   pgvector)      │  │   Results,       │  │  ┌────────────────────────────────┐  │
-│                  │  │   STACK model)   │  │  │  NVIDIA A100 80GB VM           │  │
-│  • Cell metadata │  │                  │  │  │  • STACK container             │  │
-│  • Embeddings    │  │  • Prompt cells  │  │  │  • Reads prompt/query from GCS │  │
-│  • Run history   │  │  • Query cells   │  │  │  • Writes predictions to GCS   │  │
-│                  │  │  • Predictions   │  │  └────────────────────────────────┘  │
-└──────────────────┘  └──────────────────┘  └──────────────────────────────────────┘
-            │                    │                      │
-            └────────────────────┼──────────────────────┘
-                                 │
-          ┌──────────────────────┴──────────────────────┐
-          ▼                                             ▼
-┌──────────────────────────────┐       ┌──────────────────────────────┐
-│  External APIs               │       │  LLM Providers               │
-│  (Reactome, KEGG, UniProt,   │       │  (Anthropic, OpenAI, Google) │
-│   PubMed, Ensembl)           │       │                              │
-└──────────────────────────────┘       └──────────────────────────────┘
-                                                       │
-                                                       ▼
-                                       ┌──────────────────────────────┐
-                                       │  SendGrid (Email)            │
-                                       │  • Completion notifications  │
-                                       │  • Failure alerts            │
-                                       └──────────────────────────────┘
+└───────────────────────────────────────┬─────────────────────────────────────────┘
+                                        │ Submits Batch job
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    GCP Batch — CPU Orchestrator Job                             │
+│                    e2-standard-4 (~$0.13/hr)                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                 Orchestrator Agent Container                             │   │
+│  │                                                                          │   │
+│  │   • Query understanding (LLM calls)                                      │   │
+│  │   • Prompt generation (LLM + DB queries)                                 │   │
+│  │   • Grounding evaluation (external APIs + LLM)                           │   │
+│  │   • Iteration control and convergence checking                           │   │
+│  │   • Updates status in Cloud SQL (for polling)                            │   │
+│  │   • Submits GPU Batch jobs for STACK inference                           │   │
+│  │   • Writes final results to GCS                                          │   │
+│  │   • Sends email notification on completion                               │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└───────────────────────────────────────┬─────────────────────────────────────────┘
+                                        │ Submits GPU job per iteration
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    GCP Batch — GPU Inference Job                                │
+│                    a2-highgpu-1g / NVIDIA A100 80GB (~$3/hr)                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │                 STACK Inference Container                                │   │
+│  │                                                                          │   │
+│  │   • Load STACK model from GCS                                            │   │
+│  │   • Load prompt/query cells from GCS                                     │   │
+│  │   • Run forward pass (T=5 diffusion steps)                               │   │
+│  │   • Write predictions.h5ad to GCS                                        │   │
+│  │   • Exit with status code                                                │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+          ┌─────────────────────────────┼─────────────────────────────┐
+          ▼                             ▼                             ▼
+┌──────────────────┐         ┌──────────────────┐         ┌──────────────────┐
+│  GCP Cloud SQL   │         │  GCS Bucket      │         │  External APIs   │
+│  (PostgreSQL +   │         │                  │         │                  │
+│   pgvector)      │         │  • Atlas H5ADs   │         │  • LLM Providers │
+│                  │         │  • STACK model   │         │  • Reactome/KEGG │
+│  • Cell metadata │         │  • Batch I/O     │         │  • UniProt       │
+│  • Embeddings    │         │  • Results       │         │  • PubMed        │
+│  • Run history   │         │                  │         │  • SendGrid      │
+└──────────────────┘         └──────────────────┘         └──────────────────┘
 ```
 
 ### 3.2 Request Flow
@@ -158,90 +188,79 @@ HAYSTACK is deployed as a **FastAPI backend + Next.js frontend** web application
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                           HAYSTACK REQUEST FLOW                                 │
+│                     (Two-Tier GCP Batch Architecture)                           │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │ 1. USER QUERY (via Next.js frontend)                                    │    │
-│  │    • Natural language input: "How would lung fibroblasts respond        │    │
-│  │      to TGF-beta treatment?"                                            │    │
-│  │    • User email obtained from IAP headers                               │    │
+│  │ 1. USER SUBMITS QUERY (Cloud Run API)                                   │    │
+│  │    • POST /api/v1/runs/ with natural language query                     │    │
+│  │    • User email extracted from IAP headers                              │    │
+│  │    • Cloud Run creates run record in Cloud SQL (status: "pending")      │    │
+│  │    • Cloud Run submits CPU Batch job for orchestrator                   │    │
 │  │    • Returns run_id immediately; frontend polls for status              │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │       │                                                                         │
+│       │  Cloud Run submits GCP Batch job                                        │
 │       ▼                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │ 2. ORCHESTRATOR AGENT (Background task)                                 │    │
-│  │                                                                         │    │
-│  │    ┌─────────────────────────────────────────────────────────────────┐  │    │
-│  │    │ QUERY UNDERSTANDING SUBAGENT                                    │  │    │
-│  │    │  • Parse query → StructuredQuery                                │  │    │
-│  │    │  • Resolve cell type (CL ontology)                              │  │    │
-│  │    │  • Resolve perturbation (DrugBank, PubChem)                     │  │    │
-│  │    │  • Retrieve biological priors                                   │  │    │
-│  │    └─────────────────────────────────────────────────────────────────┘  │    │
-│  │                                                                         │    │
-│  │    ┌─────────────────────────────────────────────────────────────────┐  │    │
-│  │    │ PROMPT GENERATION SUBAGENT (Parallel Strategies)                │  │    │
-│  │    │                                                                 │  │    │
-│  │    │  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐        │  │    │
-│  │    │  │  Direct   │ │Mechanistic│ │ Semantic  │ │ Ontology  │        │  │    │
-│  │    │  │  Match    │ │   Match   │ │ (Vector)  │ │  Guided   │        │  │    │
-│  │    │  └───────────┘ └───────────┘ └───────────┘ └───────────┘        │  │    │
-│  │    │         │            │             │             │              │  │    │
-│  │    │         └────────────┴─────────────┴─────────────┘              │  │    │
-│  │    │                              │                                  │  │    │
-│  │    │                              ▼                                  │  │    │
-│  │    │                  Candidate Ranking & Selection                  │  │    │
-│  │    └─────────────────────────────────────────────────────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-│       │                                                                         │
-│       ▼                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │ 3. STACK INFERENCE (GCP Batch Job - NVIDIA A100 80GB)                   │    │
-│  │                                                                         │    │
-│  │    a) Orchestrator writes prompt/query cells to GCS                     │    │
-│  │    b) Submits GCP Batch job with job config                             │    │
-│  │    c) Polls Batch API for job status                                    │    │
-│  │    d) On completion, reads predictions from GCS                         │    │
-│  │    e) On failure, error returned to agent for decision                  │    │
-│  │                                                                         │    │
-│  │    ┌─────────────────────────────────────────────────────────────────┐  │    │
-│  │    │ GCP Batch Job (Separate Container)                              │  │    │
-│  │    │  • Load STACK model from GCS                                    │  │    │
-│  │    │  • Load prompt/query cells from GCS                             │  │    │
-│  │    │  • Run STACK (Large, T=5) inference                             │  │    │
-│  │    │  • Write predictions to GCS                                     │  │    │
-│  │    │  • Exit with status code                                        │  │    │
-│  │    └─────────────────────────────────────────────────────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-│       │                                                                         │
-│       ▼                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │ 4. GROUNDING EVALUATION SUBAGENT                                        │    │
-│  │    • Extract DE genes from predictions                                  │    │
-│  │    • Run pathway enrichment (GO, KEGG, Reactome)                        │    │
-│  │    • Check literature support via PubMed                                │    │
-│  │    • Compute integer grounding score (1-10)                             │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-│       │                                                                         │
-│       ▼                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │ 5. ITERATION CONTROL                                                    │    │
-│  │    • Check cancellation: if cancelled, stop and clean up                │    │
-│  │    • Check convergence: score ≥ threshold OR max_iterations reached     │    │
-│  │    • If not converged: refine prompts, submit new Batch job             │    │
-│  │    • If converged: proceed to output generation                         │    │
-│  │    • Each iteration = separate GCP Batch job                            │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-│       │                                                                         │
-│       ▼                                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │ 6. OUTPUT GENERATION & NOTIFICATION                                     │    │
-│  │    • AnnData with predictions and metadata → GCS                        │    │
-│  │    • Interpretation report (Markdown/HTML)                              │    │
-│  │    • JSON execution log                                                 │    │
-│  │    • Update run status in database                                      │    │
-│  │    • Send email notification with results link                          │    │
+│  │ 2. CPU BATCH JOB: ORCHESTRATOR AGENT (e2-standard-4)                    │    │
+│  │    Runs entire agentic workflow in isolated container                   │    │
+│  │                                                                          │    │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │    │ 2a. QUERY UNDERSTANDING                                         │   │    │
+│  │    │     • Parse query → StructuredQuery                             │   │    │
+│  │    │     • Resolve cell type (CL ontology)                           │   │    │
+│  │    │     • Resolve perturbation (DrugBank, PubChem)                  │   │    │
+│  │    │     • Retrieve biological priors                                │   │    │
+│  │    │     • Update Cloud SQL: phase = "query_analysis"                │   │    │
+│  │    └─────────────────────────────────────────────────────────────────┘   │    │
+│  │                                                                          │    │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │    │ 2b. PROMPT GENERATION (per iteration)                           │   │    │
+│  │    │     • Run parallel retrieval strategies                         │   │    │
+│  │    │     • Rank and select prompt candidates                         │   │    │
+│  │    │     • Update Cloud SQL: phase = "prompt_generation"             │   │    │
+│  │    └─────────────────────────────────────────────────────────────────┘   │    │
+│  │         │                                                                │    │
+│  │         │  Orchestrator submits GPU Batch job                            │    │
+│  │         ▼                                                                │    │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │    │ 2c. STACK INFERENCE (GPU Batch Job - A100 80GB)                 │   │    │
+│  │    │     • Write prompt/query cells to GCS                           │   │    │
+│  │    │     • Submit GPU Batch job                                      │   │    │
+│  │    │     • Poll for completion (10s intervals)                       │   │    │
+│  │    │     • Read predictions from GCS                                 │   │    │
+│  │    │     • Update Cloud SQL: phase = "inference"                     │   │    │
+│  │    └─────────────────────────────────────────────────────────────────┘   │    │
+│  │         │                                                                │    │
+│  │         ▼                                                                │    │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │    │ 2d. GROUNDING EVALUATION                                        │   │    │
+│  │    │     • Extract DE genes from predictions                         │   │    │
+│  │    │     • Run pathway enrichment (GO, KEGG, Reactome)               │   │    │
+│  │    │     • Check literature support via PubMed                       │   │    │
+│  │    │     • Compute grounding score (1-10)                            │   │    │
+│  │    │     • Update Cloud SQL: phase = "evaluation", scores            │   │    │
+│  │    └─────────────────────────────────────────────────────────────────┘   │    │
+│  │         │                                                                │    │
+│  │         ▼                                                                │    │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │    │ 2e. ITERATION CONTROL                                           │   │    │
+│  │    │     • Check Cloud SQL for cancellation flag                     │   │    │
+│  │    │     • Check convergence: score ≥ threshold OR max iterations    │   │    │
+│  │    │     • If not converged: loop back to 2b                         │   │    │
+│  │    │     • If converged: proceed to output generation                │   │    │
+│  │    └─────────────────────────────────────────────────────────────────┘   │    │
+│  │         │                                                                │    │
+│  │         ▼                                                                │    │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │    │ 2f. OUTPUT GENERATION & NOTIFICATION                            │   │    │
+│  │    │     • Write AnnData with predictions to GCS                     │   │    │
+│  │    │     • Generate interpretation report                            │   │    │
+│  │    │     • Update Cloud SQL: status = "completed"                    │   │    │
+│  │    │     • Send email notification via SendGrid                      │   │    │
+│  │    │     • Exit with success code                                    │   │    │
+│  │    └─────────────────────────────────────────────────────────────────┘   │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -253,14 +272,15 @@ HAYSTACK is deployed as a **FastAPI backend + Next.js frontend** web application
 │  User submits query                                                             │
 │       │                                                                         │
 │       ▼                                                                         │
-│  POST /api/v1/runs/ ──────► Returns { run_id, status: "pending" }               │
+│  POST /api/v1/runs/ ──────► Cloud Run submits CPU Batch job                     │
+│                             Returns { run_id, status: "pending" }               │
 │       │                                                                         │
 │       ▼                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
 │  │  Poll every 15 seconds:                                                 │    │
 │  │  GET /api/v1/runs/{run_id}                                              │    │
 │  │                                                                         │    │
-│  │  Response includes:                                                     │    │
+│  │  Cloud Run reads from Cloud SQL (updated by CPU Batch job):             │    │
 │  │  • status: pending | running | completed | failed | cancelled           │    │
 │  │  • current_iteration: 1, 2, 3...                                        │    │
 │  │  • current_phase: "query_analysis" | "prompt_generation" |              │    │
@@ -277,80 +297,116 @@ HAYSTACK is deployed as a **FastAPI backend + Next.js frontend** web application
 │                                                                                 │
 │  User also receives email: "Your HAYSTACK run is complete. View results: ..."   │
 │                                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────────  │
+│                                                                                 │
+│  CANCELLATION FLOW:                                                             │
+│  POST /api/v1/runs/{run_id}/cancel                                              │
+│       │                                                                         │
+│       ▼                                                                         │
+│  Cloud Run sets cancellation flag in Cloud SQL                                  │
+│  Cloud Run calls Batch API to delete CPU orchestrator job                       │
+│  (GPU job, if running, is also cancelled)                                       │
+│                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 3.3 Component Responsibilities
 
-| Component | Responsibility | Technology |
-|-----------|---------------|------------|
-| Frontend | User interface, query input, status polling, result visualization | Next.js, TypeScript, TanStack Query |
-| API Layer | REST endpoints, request validation, IAP user extraction | FastAPI, Pydantic |
-| Orchestrator Agent | Manages iteration loop, coordinates subagents, submits Batch jobs | LangChain, DeepAgents |
-| Query Understanding | Parses queries, resolves entities, retrieves priors | LangChain tools |
-| Prompt Generation | Generates and ranks prompt candidates | LangChain tools |
-| Grounding Evaluation | Evaluates predictions, computes scores | LangChain tools |
-| STACK Inference | GPU-accelerated model inference (separate from Cloud Run) | GCP Batch, NVIDIA A100 80GB |
-| Database | Cell metadata, vector embeddings, run history | Cloud SQL (PostgreSQL + pgvector) |
-| Object Storage | Atlas H5AD files, STACK model, intermediate/final results | GCS |
-| Email Service | Completion/failure notifications | SendGrid |
+| Component | Responsibility | Technology | Runs In |
+|-----------|---------------|------------|---------|
+| Frontend | User interface, query input, status polling, result visualization | Next.js, TypeScript, TanStack Query | Cloud Run |
+| API Layer | Job submission, status queries, cancellation, static file serving | FastAPI, Pydantic | Cloud Run |
+| Orchestrator Agent | Full agentic workflow: query analysis, prompt generation, iteration control | LangChain, DeepAgents | CPU Batch Job |
+| Query Understanding | Parses queries, resolves entities, retrieves priors | LangChain tools | CPU Batch Job |
+| Prompt Generation | Generates and ranks prompt candidates | LangChain tools | CPU Batch Job |
+| Grounding Evaluation | Evaluates predictions, computes scores | LangChain tools | CPU Batch Job |
+| STACK Inference | GPU-accelerated model inference | PyTorch, STACK | GPU Batch Job |
+| Database | Cell metadata, vector embeddings, run history/status | Cloud SQL (PostgreSQL + pgvector) | GCP Managed |
+| Object Storage | Atlas H5AD files, STACK model, Batch I/O, results | GCS | GCP Managed |
+| Email Service | Completion/failure notifications | SendGrid | CPU Batch Job |
 
-### 3.4 GCP Batch Job Lifecycle
-
-Each STACK inference iteration follows this lifecycle:
+### 3.4 Two-Tier Batch Job Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                       GCP BATCH JOB LIFECYCLE                                   │
+│                    TWO-TIER BATCH JOB ARCHITECTURE                              │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  Cloud Run (Orchestrator)                    GCP Batch (STACK)                  │
-│  ─────────────────────────                   ──────────────────                 │
+│  Cloud Run (API)              CPU Batch (Orchestrator)    GPU Batch (STACK)     │
+│  ───────────────              ────────────────────────    ─────────────────     │
 │                                                                                 │
-│  1. Prepare inference inputs                                                    │
-│     • Extract prompt cells from atlas                                           │
-│     • Extract query cells (control state)                                       │
-│     • Write prompt.h5ad to GCS                                                  │
-│     • Write query.h5ad to GCS                                                   │
+│  1. Receive POST /runs/                                                         │
+│     • Validate request                                                          │
+│     • Create run in DB                                                          │
 │            │                                                                    │
 │            ▼                                                                    │
-│  2. Submit Batch job ───────────────────────► Job queued                        │
-│     • Job config with GPU specs                                                 │
-│     • Container image + args                                                    │
-│     • GCS paths for I/O                                                         │
-│            │                                        │                           │
-│            │                                        ▼                           │
-│  3. Poll job status ◄─────────────────────── Job running                        │
-│     • GET /jobs/{job_id}                     • Pull container image             │
-│     • Update run status in DB                • Load STACK model                 │
-│     • Sleep 10s, repeat                      • Load cells from GCS              │
-│            │                                 • Run forward pass (T=5)           │
-│            │                                 • Write predictions.h5ad to GCS    │
-│            │                                        │                           │
-│            │                                        ▼                           │
-│  4. Job completed ◄──────────────────────── Job succeeded/failed                │
+│  2. Submit CPU Batch job ─────────► Job starts                                  │
+│     • Pass run_id, query           • Connect to Cloud SQL                       │
+│     • Return run_id to user        • Update status: "running"                   │
+│            │                       • Begin agent workflow                       │
+│            │                              │                                     │
+│  3. Poll GET /runs/{id}                   │                                     │
+│     • Read status from DB                 │                                     │
+│     • Return to frontend                  │                                     │
+│            │                              │                                     │
+│            │                              ▼                                     │
+│            │               [Iteration N]                                        │
+│            │                 • Generate prompts                                 │
+│            │                 • Write cells to GCS                               │
+│            │                        │                                           │
+│            │                        ▼                                           │
+│            │               Submit GPU job ──────────► Job starts                │
+│            │                 • Poll for completion    • Load STACK model        │
+│            │                 • 10s intervals          • Run inference           │
+│            │                        │                 • Write to GCS            │
+│            │                        │                        │                  │
+│            │                        ◄────────────────────────┘                  │
+│            │                 • Read predictions                                 │
+│            │                 • Evaluate grounding                               │
+│            │                 • Update DB with scores                            │
+│            │                 • Check convergence                                │
+│            │                        │                                           │
+│            │                        ▼                                           │
+│            │               [If not converged: loop]                             │
+│            │               [If converged: continue]                             │
+│            │                        │                                           │
+│            │                        ▼                                           │
+│            │               Output generation                                    │
+│            │                 • Write results to GCS                             │
+│            │                 • Update DB: "completed"                           │
+│            │                 • Send email                                       │
+│            │                 • Exit                                             │
 │            │                                                                    │
-│            ▼                                                                    │
-│  5. Handle result                                                               │
-│     • Success: Read predictions from GCS                                        │
-│     • Failure: Return error to agent                                            │
-│            │                                                                    │
-│            ▼                                                                    │
-│  6. Continue to grounding evaluation                                            │
+│  4. GET /runs/{id}/result                                                       │
+│     • Generate signed URLs                                                      │
+│     • Return to user                                                            │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
-``` |
 
-### 3.6 State Management
+COST EFFICIENCY:
+┌────────────────────┬─────────────────┬──────────────────────────────────────────┐
+│ Component          │ Hourly Cost     │ Usage Pattern                            │
+├────────────────────┼─────────────────┼──────────────────────────────────────────┤
+│ CPU Orchestrator   │ ~$0.13/hr       │ Runs for entire workflow (10-30 min)     │
+│ (e2-standard-4)    │                 │ Active during LLM calls, DB queries      │
+├────────────────────┼─────────────────┼──────────────────────────────────────────┤
+│ GPU Inference      │ ~$3.00/hr       │ Only during STACK inference (~2-5 min    │
+│ (A100 80GB)        │                 │ per iteration, 1-5 iterations)           │
+├────────────────────┼─────────────────┼──────────────────────────────────────────┤
+│ Cloud Run          │ ~$0.00024/req   │ Minimal: job submission + status polls   │
+└────────────────────┴─────────────────┴──────────────────────────────────────────┘
+```
+
+### 3.5 State Management
 
 HAYSTACK uses a combination of state management approaches:
 
-- **Database state**: Run metadata, cell groups, and vector embeddings stored in Cloud SQL
-- **Object storage state**: Atlas files, STACK checkpoints, and result artifacts stored in GCS
-- **Batch job communication**: Prompt/query cells and predictions exchanged via GCS between Cloud Run and Batch jobs
-- **In-memory state**: Agent execution state maintained via LangGraph checkpointing during a run
+- **Database state**: Run metadata, status, iteration progress stored in Cloud SQL (shared between Cloud Run and Batch jobs)
+- **Object storage state**: Atlas files, STACK checkpoints, Batch I/O, and result artifacts stored in GCS
+- **Batch job communication**: CPU orchestrator → GPU inference via GCS (prompt/query cells in, predictions out)
+- **In-memory state**: Agent execution state maintained via LangGraph checkpointing within the CPU Batch job
 - **Frontend state**: Run status and UI state managed via Zustand stores
-- **Polling state**: Frontend polls API every 15 seconds for status updates
+- **Cancellation**: Cloud Run sets flag in Cloud SQL; CPU Batch job checks flag between iterations
 
 ---
 
@@ -1457,53 +1513,80 @@ class HaystackDatabase:
 
 ### 9.1 Project Structure
 
+The backend is split into two components:
+1. **`api/`** — Thin FastAPI layer running on Cloud Run (job submission, status queries)
+2. **`orchestrator/`** — Agent workflow running in CPU Batch job
+
 ```
-backend/
-├── __init__.py
-├── main.py                 # FastAPI app factory
-├── config.py               # Dynaconf settings
-├── context.py              # Dependency injection context
-├── dependencies.py         # FastAPI dependencies
-├── api/
+haystack/
+├── api/                        # Cloud Run API (thin layer)
 │   ├── __init__.py
-│   └── routes/
-│       ├── __init__.py
-│       ├── runs.py         # /api/v1/runs endpoints
-│       ├── cells.py        # /api/v1/cells endpoints
-│       ├── metadata.py     # /api/v1/metadata endpoints
-│       └── health.py       # Health check
-├── models/
+│   ├── main.py                 # FastAPI app factory
+│   ├── config.py               # Dynaconf settings
+│   ├── dependencies.py         # IAP user extraction
+│   ├── routes/
+│   │   ├── __init__.py
+│   │   ├── runs.py             # /api/v1/runs endpoints
+│   │   ├── cells.py            # /api/v1/cells endpoints
+│   │   ├── metadata.py         # /api/v1/metadata endpoints
+│   │   └── health.py           # Health check
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── runs.py             # Run-related Pydantic models
+│   │   └── cells.py            # Cell-related models
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── database.py         # Cloud SQL client (read status)
+│   │   ├── gcs.py              # GCS signed URLs
+│   │   └── batch.py            # GCP Batch job submission
+│   └── tests/
+│       └── ...
+│
+├── orchestrator/               # CPU Batch Job (agent workflow)
 │   ├── __init__.py
-│   ├── runs.py             # Run-related Pydantic models
-│   ├── cells.py            # Cell-related models
-│   └── notifications.py    # Email notification models
-├── services/
+│   ├── main.py                 # Entrypoint for Batch job
+│   ├── config.py               # Dynaconf settings
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   ├── orchestrator.py     # Main orchestrator loop
+│   │   ├── query_understanding.py
+│   │   ├── prompt_generation.py
+│   │   └── grounding_evaluation.py
+│   ├── tools/
+│   │   ├── __init__.py
+│   │   ├── database_tools.py   # Cell retrieval tools
+│   │   ├── knowledge_tools.py  # External API tools
+│   │   ├── inference_tools.py  # GPU job submission
+│   │   └── enrichment_tools.py # Pathway enrichment
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── database.py         # Cloud SQL client (update status)
+│   │   ├── gcs.py              # GCS read/write
+│   │   ├── batch.py            # GPU Batch job submission
+│   │   ├── email.py            # SendGrid notifications
+│   │   └── biological_apis.py  # KEGG, Reactome, etc.
+│   └── tests/
+│       └── ...
+│
+├── inference/                  # GPU Batch Job (STACK only)
 │   ├── __init__.py
-│   ├── database.py         # HaystackDatabase client
-│   ├── gcs.py              # GCS operations
-│   ├── biological_apis.py  # External API clients
-│   ├── stack_inference.py  # STACK model wrapper
-│   ├── batch.py            # GCP Batch client
-│   └── email.py            # SendGrid email notifications
-├── agents/
+│   ├── run_inference.py        # Entrypoint for GPU job
+│   └── stack_wrapper.py        # STACK model loading/inference
+│
+├── shared/                     # Shared code between components
 │   ├── __init__.py
-│   ├── orchestrator.py     # Main orchestrator
-│   ├── query_understanding.py
-│   ├── prompt_generation.py
-│   └── grounding_evaluation.py
-├── tools/
-│   ├── __init__.py
-│   ├── database_tools.py
-│   ├── knowledge_tools.py
-│   ├── inference_tools.py
-│   └── enrichment_tools.py
-├── workers/
-│   └── run_worker.py       # Background run execution
-└── tests/
-    ├── __init__.py
-    ├── conftest.py
-    ├── test_api/
-    └── test_services/
+│   ├── models/                 # Shared Pydantic models
+│   │   ├── runs.py
+│   │   ├── cells.py
+│   │   └── queries.py
+│   └── config.py               # Shared configuration
+│
+├── docker/
+│   ├── Dockerfile.api          # Cloud Run container
+│   ├── Dockerfile.orchestrator # CPU Batch container
+│   └── Dockerfile.inference    # GPU Batch container
+│
+└── pyproject.toml
 ```
 
 ### 9.2 Main Application
@@ -1518,11 +1601,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from backend.config import settings
-from backend.api.routes import runs, cells, metadata, health
-from backend.services.database import database
-from backend.services.gcs import gcs_service
-from backend.services.email import email_service
+from api.config import settings
+from api.routes import runs, cells, metadata, health
+from api.services.database import database
+from api.services.gcs import gcs_service
 
 
 @asynccontextmanager
@@ -1531,14 +1613,23 @@ async def lifespan(app: FastAPI):
     # Startup
     await database.connect()
     await gcs_service.initialize()
-    email_service.initialize()
     yield
     # Shutdown
     await database.close()
 
 
 def create_app() -> FastAPI:
-    """Create and configure FastAPI application."""
+    """
+    Create and configure FastAPI application.
+    
+    This is a thin API layer that:
+    - Submits CPU Batch jobs for orchestrator workflow
+    - Reads run status from Cloud SQL
+    - Cancels Batch jobs via API
+    - Serves static frontend
+    
+    The actual agent workflow runs in a separate CPU Batch job.
+    """
     app = FastAPI(
         title="HAYSTACK API",
         description="Iterative Knowledge-Guided Cell Prompting System",
@@ -1572,57 +1663,82 @@ def create_app() -> FastAPI:
 app = create_app()
 ```
 
-### 9.3 API Endpoints
+### 9.3 API Endpoints (Cloud Run)
+
+The Cloud Run API is intentionally thin — it submits Batch jobs and queries status from Cloud SQL.
 
 ```python
-# backend/api/routes/runs.py
-"""Run management endpoints."""
+# api/routes/runs.py
+"""Run management endpoints (thin layer)."""
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from datetime import datetime
+from uuid import uuid4
+from fastapi import APIRouter, HTTPException, Depends
 from typing import Optional
 
-from backend.models.runs import (
+from shared.models.runs import (
     CreateRunRequest,
     RunStatusResponse,
     RunResultResponse,
     RunListResponse,
 )
-from backend.services.database import database
-from backend.agents.orchestrator import run_haystack_pipeline
-from backend.dependencies import get_current_user
+from api.services.database import database
+from api.services.batch import batch_client
+from api.services.gcs import gcs_service
+from api.dependencies import get_current_user
 
 router = APIRouter()
+
+
+def generate_run_id() -> str:
+    """Generate a unique run ID."""
+    return f"run_{uuid4().hex[:12]}"
 
 
 @router.post("/", response_model=RunStatusResponse)
 async def create_run(
     request: CreateRunRequest,
-    background_tasks: BackgroundTasks,
     user_email: str = Depends(get_current_user),
 ):
     """
     Create a new HAYSTACK run.
     
-    Starts the iterative optimization pipeline in the background.
+    Submits a CPU Batch job to run the orchestrator workflow.
     Returns immediately with run_id for status polling.
     """
     run_id = generate_run_id()
     
-    # Create run record
+    # Create run record in database
     await database.create_run(
         run_id=run_id,
         user_email=user_email,
         query=request.query,
-        config=request.dict(),
+        config=request.model_dump(),
+        status="pending",
     )
     
-    # Start pipeline in background
-    background_tasks.add_task(
-        run_haystack_pipeline,
-        run_id=run_id,
-        query=request.query,
-        config=request.dict(),
-    )
+    # Submit CPU Batch job for orchestrator
+    try:
+        job_name = await batch_client.submit_orchestrator_job(
+            run_id=run_id,
+            query=request.query,
+            user_email=user_email,
+            config=request.model_dump(),
+        )
+        
+        # Store Batch job name for cancellation
+        await database.update_run(
+            run_id=run_id,
+            batch_job_name=job_name,
+        )
+        
+    except Exception as e:
+        await database.update_run(
+            run_id=run_id,
+            status="failed",
+            error_message=f"Failed to submit Batch job: {e}",
+        )
+        raise HTTPException(500, f"Failed to submit run: {e}")
     
     return RunStatusResponse(
         run_id=run_id,
@@ -1711,20 +1827,175 @@ async def cancel_run(run_id: str):
     if not run:
         raise HTTPException(404, f"Run {run_id} not found")
     
-    if run["status"] != "running":
-        raise HTTPException(400, f"Run {run_id} is not running")
+    if run["status"] not in ("pending", "running"):
+        raise HTTPException(400, f"Run {run_id} cannot be cancelled (status: {run['status']})")
     
-    await database.update_run_status(run_id, "cancelled")
+    # Set cancellation flag in database
+    await database.update_run(run_id=run_id, status="cancelled")
+    
+    # Cancel the Batch job if it exists
+    batch_job_name = run.get("batch_job_name")
+    if batch_job_name:
+        try:
+            await batch_client.cancel_job(batch_job_name)
+        except Exception as e:
+            # Job may have already completed or failed
+            logger.warning(f"Failed to cancel Batch job {batch_job_name}: {e}")
+    
     return {"message": f"Run {run_id} cancelled"}
 ```
 
-### 9.4 IAP User Extraction
+### 9.4 Batch Client (Cloud Run)
+
+The Cloud Run API uses this client to submit and cancel CPU orchestrator jobs.
 
 ```python
-# backend/dependencies.py
+# api/services/batch.py
+"""GCP Batch client for submitting orchestrator jobs."""
+
+import logging
+from google.cloud import batch_v1
+
+from api.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class BatchClient:
+    """Client for submitting CPU orchestrator Batch jobs."""
+    
+    def __init__(self):
+        self.client = batch_v1.BatchServiceAsyncClient()
+        self.project = settings.gcp_project_id
+        self.region = settings.batch.region
+    
+    async def submit_orchestrator_job(
+        self,
+        run_id: str,
+        query: str,
+        user_email: str,
+        config: dict,
+    ) -> str:
+        """
+        Submit a CPU Batch job to run the orchestrator agent.
+        
+        Args:
+            run_id: Unique run identifier
+            query: User's natural language query
+            user_email: User's email for notifications
+            config: Run configuration
+        
+        Returns:
+            Batch job name for tracking/cancellation
+        """
+        job_name = f"haystack-orchestrator-{run_id}"
+        
+        # Container configuration
+        container = batch_v1.Runnable.Container(
+            image_uri=settings.batch.orchestrator_image,
+            commands=["python", "-m", "orchestrator.main"],
+            options=f"--env RUN_ID={run_id} --env USER_EMAIL={user_email}",
+        )
+        
+        runnable = batch_v1.Runnable(container=container)
+        
+        # Task specification
+        task_spec = batch_v1.TaskSpec(
+            runnables=[runnable],
+            max_retry_count=0,  # No retries - let agent handle errors
+            max_run_duration="7200s",  # 2 hour max
+        )
+        
+        # Resource requirements (CPU only)
+        resources = batch_v1.ComputeResource(
+            cpu_milli=4000,   # 4 vCPUs
+            memory_mib=16384,  # 16 GB RAM
+        )
+        task_spec.compute_resource = resources
+        
+        # Task group
+        task_group = batch_v1.TaskGroup(
+            task_count=1,
+            task_spec=task_spec,
+        )
+        
+        # Allocation policy (CPU machine)
+        instance_policy = batch_v1.AllocationPolicy.InstancePolicy(
+            machine_type=settings.batch.orchestrator_machine_type,
+        )
+        
+        instances = batch_v1.AllocationPolicy.InstancePolicyOrTemplate(
+            policy=instance_policy,
+        )
+        
+        allocation_policy = batch_v1.AllocationPolicy(
+            instances=[instances],
+            location=batch_v1.AllocationPolicy.LocationPolicy(
+                allowed_locations=[f"regions/{self.region}"],
+            ),
+        )
+        
+        # Network configuration for Cloud SQL access
+        network_policy = batch_v1.AllocationPolicy.NetworkPolicy(
+            network_interfaces=[
+                batch_v1.AllocationPolicy.NetworkInterface(
+                    network=f"projects/{self.project}/global/networks/default",
+                    subnetwork=f"projects/{self.project}/regions/{self.region}/subnetworks/default",
+                )
+            ]
+        )
+        allocation_policy.network = network_policy
+        
+        # Service account
+        service_account = batch_v1.ServiceAccount(
+            email=settings.batch.orchestrator_service_account,
+        )
+        allocation_policy.service_account = service_account
+        
+        # Create job
+        job = batch_v1.Job(
+            task_groups=[task_group],
+            allocation_policy=allocation_policy,
+            logs_policy=batch_v1.LogsPolicy(
+                destination=batch_v1.LogsPolicy.Destination.CLOUD_LOGGING,
+            ),
+            labels={
+                "haystack-run-id": run_id,
+                "haystack-component": "orchestrator",
+            },
+        )
+        
+        # Submit job
+        request = batch_v1.CreateJobRequest(
+            parent=f"projects/{self.project}/locations/{self.region}",
+            job_id=job_name,
+            job=job,
+        )
+        
+        response = await self.client.create_job(request=request)
+        logger.info(f"Submitted orchestrator job: {response.name}")
+        
+        return response.name
+    
+    async def cancel_job(self, job_name: str) -> None:
+        """Cancel a Batch job."""
+        request = batch_v1.DeleteJobRequest(name=job_name)
+        await self.client.delete_job(request=request)
+        logger.info(f"Cancelled job: {job_name}")
+
+
+# Global client instance
+batch_client = BatchClient()
+```
+
+### 9.5 IAP User Extraction
+
+```python
+# api/dependencies.py
 """FastAPI dependencies including IAP user extraction."""
 
 from fastapi import Request, HTTPException
+from api.config import settings
 
 
 def get_current_user(request: Request) -> str:
@@ -1755,10 +2026,310 @@ def get_current_user(request: Request) -> str:
     return iap_email
 ```
 
-### 9.5 Email Notification Service
+---
+
+## 10. Orchestrator Specification (CPU Batch Job)
+
+The orchestrator runs as a CPU Batch job, separate from Cloud Run. This provides:
+- State persistence across browser disconnects
+- No Cloud Run timeout concerns (60 min limit)
+- Parallel runs per user
+- Cost efficiency (only pay when running)
+
+### 10.1 Orchestrator Entrypoint
 
 ```python
-# backend/services/email.py
+# orchestrator/main.py
+"""Entrypoint for the CPU Batch job orchestrator."""
+
+import os
+import sys
+import asyncio
+import logging
+
+from orchestrator.config import settings
+from orchestrator.services.database import database
+from orchestrator.services.email import email_service
+from orchestrator.agents.orchestrator import OrchestratorAgent
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+async def main():
+    """Main orchestrator workflow."""
+    # Get run parameters from environment
+    run_id = os.environ.get("RUN_ID")
+    user_email = os.environ.get("USER_EMAIL")
+    
+    if not run_id:
+        logger.error("RUN_ID environment variable not set")
+        sys.exit(1)
+    
+    logger.info(f"Starting orchestrator for run {run_id}")
+    
+    try:
+        # Connect to database
+        await database.connect()
+        email_service.initialize()
+        
+        # Load run configuration from database
+        run = await database.get_run(run_id)
+        if not run:
+            logger.error(f"Run {run_id} not found in database")
+            sys.exit(1)
+        
+        query = run["query"]
+        config = run["config"]
+        
+        # Update status to running
+        await database.update_run(
+            run_id=run_id,
+            status="running",
+            current_phase="query_analysis",
+        )
+        
+        # Initialize and run orchestrator agent
+        agent = OrchestratorAgent(
+            run_id=run_id,
+            query=query,
+            user_email=user_email,
+            config=config,
+        )
+        
+        result = await agent.run()
+        
+        # Send completion email
+        if result.success:
+            await email_service.send_run_completed(
+                recipient_email=user_email,
+                run_id=run_id,
+                query=query,
+                grounding_score=result.final_score,
+            )
+            logger.info(f"Run {run_id} completed successfully with score {result.final_score}")
+        else:
+            await email_service.send_run_failed(
+                recipient_email=user_email,
+                run_id=run_id,
+                query=query,
+                error_message=result.error_message,
+            )
+            logger.error(f"Run {run_id} failed: {result.error_message}")
+        
+    except Exception as e:
+        logger.exception(f"Orchestrator failed for run {run_id}")
+        
+        # Update database with error
+        await database.update_run(
+            run_id=run_id,
+            status="failed",
+            error_message=str(e),
+        )
+        
+        # Send failure email
+        try:
+            await email_service.send_run_failed(
+                recipient_email=user_email,
+                run_id=run_id,
+                query=run.get("query", ""),
+                error_message=str(e),
+            )
+        except Exception:
+            pass  # Don't fail on email error
+        
+        sys.exit(1)
+        
+    finally:
+        await database.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 10.2 Orchestrator Agent
+
+```python
+# orchestrator/agents/orchestrator.py
+"""Main orchestrator agent that runs the iterative workflow."""
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+from orchestrator.services.database import database
+from orchestrator.services.batch import gpu_batch_client
+from orchestrator.services.gcs import gcs_service
+from orchestrator.agents.query_understanding import QueryUnderstandingAgent
+from orchestrator.agents.prompt_generation import PromptGenerationAgent
+from orchestrator.agents.grounding_evaluation import GroundingEvaluationAgent
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OrchestratorResult:
+    """Result of orchestrator execution."""
+    success: bool
+    final_score: Optional[int] = None
+    error_message: Optional[str] = None
+
+
+class OrchestratorAgent:
+    """
+    Main orchestrator that runs the iterative HAYSTACK workflow.
+    
+    Runs in a CPU Batch job and submits GPU Batch jobs for STACK inference.
+    """
+    
+    def __init__(
+        self,
+        run_id: str,
+        query: str,
+        user_email: str,
+        config: dict,
+    ):
+        self.run_id = run_id
+        self.query = query
+        self.user_email = user_email
+        self.config = config
+        
+        self.max_iterations = config.get("max_iterations", 5)
+        self.score_threshold = config.get("score_threshold", 7)
+        
+        # Initialize subagents
+        self.query_agent = QueryUnderstandingAgent()
+        self.prompt_agent = PromptGenerationAgent()
+        self.evaluation_agent = GroundingEvaluationAgent()
+    
+    async def run(self) -> OrchestratorResult:
+        """Execute the full iterative workflow."""
+        try:
+            # Step 1: Query understanding
+            logger.info(f"[{self.run_id}] Starting query analysis")
+            await self._update_phase("query_analysis")
+            
+            structured_query = await self.query_agent.analyze(self.query)
+            
+            # Iteration loop
+            scores = []
+            for iteration in range(1, self.max_iterations + 1):
+                logger.info(f"[{self.run_id}] Starting iteration {iteration}")
+                
+                # Check for cancellation
+                if await self._is_cancelled():
+                    logger.info(f"[{self.run_id}] Run cancelled")
+                    return OrchestratorResult(success=False, error_message="Cancelled by user")
+                
+                # Step 2: Prompt generation
+                await self._update_phase("prompt_generation", iteration)
+                prompt_cells = await self.prompt_agent.generate(
+                    structured_query=structured_query,
+                    iteration=iteration,
+                    previous_scores=scores,
+                )
+                
+                # Step 3: STACK inference (GPU Batch job)
+                await self._update_phase("inference", iteration)
+                predictions = await self._run_inference(iteration, prompt_cells)
+                
+                # Check for cancellation after long inference
+                if await self._is_cancelled():
+                    return OrchestratorResult(success=False, error_message="Cancelled by user")
+                
+                # Step 4: Grounding evaluation
+                await self._update_phase("evaluation", iteration)
+                eval_result = await self.evaluation_agent.evaluate(
+                    predictions=predictions,
+                    query=structured_query,
+                )
+                
+                score = eval_result.score
+                scores.append(score)
+                
+                # Update database with score
+                await database.update_run(
+                    run_id=self.run_id,
+                    grounding_scores=scores,
+                    current_iteration=iteration,
+                )
+                
+                logger.info(f"[{self.run_id}] Iteration {iteration} score: {score}")
+                
+                # Check convergence
+                if score >= self.score_threshold:
+                    logger.info(f"[{self.run_id}] Converged with score {score}")
+                    break
+            
+            # Step 5: Output generation
+            await self._update_phase("output_generation")
+            output_paths = await self._generate_outputs(predictions, scores)
+            
+            # Update database with completion
+            final_score = scores[-1] if scores else 0
+            await database.update_run(
+                run_id=self.run_id,
+                status="completed",
+                final_score=final_score,
+                output_anndata_path=output_paths["anndata"],
+                output_report_path=output_paths["report"],
+                output_log_path=output_paths["log"],
+            )
+            
+            return OrchestratorResult(success=True, final_score=final_score)
+            
+        except Exception as e:
+            logger.exception(f"[{self.run_id}] Orchestrator error")
+            await database.update_run(
+                run_id=self.run_id,
+                status="failed",
+                error_message=str(e),
+            )
+            return OrchestratorResult(success=False, error_message=str(e))
+    
+    async def _is_cancelled(self) -> bool:
+        """Check if the run has been cancelled."""
+        run = await database.get_run(self.run_id)
+        return run.get("status") == "cancelled"
+    
+    async def _update_phase(self, phase: str, iteration: int = None):
+        """Update the current phase in the database."""
+        update = {"current_phase": phase}
+        if iteration:
+            update["current_iteration"] = iteration
+        await database.update_run(run_id=self.run_id, **update)
+    
+    async def _run_inference(self, iteration: int, prompt_cells) -> "AnnData":
+        """Submit GPU Batch job for STACK inference."""
+        # Write inputs to GCS
+        gcs_prefix = f"batch-io/{self.run_id}/iter_{iteration}"
+        await gcs_service.write_anndata(f"{gcs_prefix}/prompt.h5ad", prompt_cells)
+        
+        # Submit GPU job and wait for completion
+        predictions_path = await gpu_batch_client.run_inference(
+            run_id=self.run_id,
+            iteration=iteration,
+            prompt_path=f"{gcs_prefix}/prompt.h5ad",
+            output_path=f"{gcs_prefix}/predictions.h5ad",
+        )
+        
+        # Read predictions from GCS
+        return await gcs_service.read_anndata(predictions_path)
+    
+    async def _generate_outputs(self, predictions, scores) -> dict:
+        """Generate final output files."""
+        # Implementation details...
+        pass
+```
+
+### 10.3 Email Notification Service (Orchestrator)
+
+```python
+# orchestrator/services/email.py
 """Email notification service using SendGrid."""
 
 import logging
@@ -1766,52 +2337,9 @@ from typing import Optional
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail, Email, To, Content
 
-from backend.config import settings
+from orchestrator.config import settings
 
 logger = logging.getLogger(__name__)
-
-
-class EmailService:
-    """Service for sending email notifications."""
-    
-    def __init__(self):
-        self.client: Optional[SendGridAPIClient] = None
-        self.from_email = "haystack@arc.institute"
-        self.base_url = settings.frontend_url
-    
-    def initialize(self):
-        """Initialize SendGrid client."""
-        api_key = settings.sendgrid_api_key
-        if api_key:
-            self.client = SendGridAPIClient(api_key)
-            logger.info("SendGrid client initialized")
-        else:
-            logger.warning("SENDGRID_API_KEY not set, emails disabled")
-    
-    async def send_run_completed(
-        self,
-        recipient_email: str,
-        run_id: str,
-        query: str,
-        grounding_score: int,
-    ) -> bool:
-        """
-        Send email notification when a run completes successfully.
-        
-        Args:
-            recipient_email: User's email address
-            run_id: HAYSTACK run ID
-            query: Original user query
-            grounding_score: Final grounding score
-        
-        Returns:
-            True if email sent successfully
-        """
-        if not self.client:
-            logger.warning(f"Email disabled, skipping notification for run {run_id}")
-            return False
-        
-        results_url = f"{self.base_url}/runs/{run_id}"
         
         subject = f"HAYSTACK run complete (score: {grounding_score}/10)"
         
@@ -1930,191 +2458,9 @@ class EmailService:
 email_service = EmailService()
 ```
 
-### 9.6 Run Worker with Email Notifications
-
-```python
-# backend/workers/run_worker.py
-"""Background worker for executing HAYSTACK runs."""
-
-import logging
-from datetime import datetime
-
-from backend.services.database import database
-from backend.services.email import email_service
-from backend.services.batch import batch_client
-from backend.agents.orchestrator import OrchestratorAgent
-
-logger = logging.getLogger(__name__)
-
-
-async def run_haystack_pipeline(
-    run_id: str,
-    query: str,
-    config: dict,
-):
-    """
-    Execute the HAYSTACK pipeline in the background.
-    
-    Updates run status in database and sends email notification on completion.
-    
-    Args:
-        run_id: Unique run identifier
-        query: User's natural language query
-        config: Run configuration
-    """
-    try:
-        # Update status to running
-        await database.update_run(
-            run_id=run_id,
-            status="running",
-            current_phase="query_analysis",
-            updated_at=datetime.utcnow(),
-        )
-        
-        # Get run record for user email
-        run = await database.get_run(run_id)
-        user_email = run["user_email"]
-        
-        # Initialize orchestrator agent
-        orchestrator = OrchestratorAgent(config=config)
-        
-        # Execute iterative pipeline
-        iteration = 0
-        max_iterations = config.get("max_iterations", 5)
-        score_threshold = config.get("score_threshold", 7)
-        
-        while iteration < max_iterations:
-            # Check for cancellation
-            run = await database.get_run(run_id)
-            if run["status"] == "cancelled":
-                logger.info(f"Run {run_id} was cancelled")
-                await email_service.send_run_cancelled(
-                    recipient_email=user_email,
-                    run_id=run_id,
-                    query=query,
-                )
-                return
-            
-            iteration += 1
-            
-            # Update phase: prompt generation
-            await database.update_run(
-                run_id=run_id,
-                current_phase="prompt_generation",
-                current_iteration=iteration,
-                updated_at=datetime.utcnow(),
-            )
-            
-            # Generate prompts
-            prompt_cells = await orchestrator.generate_prompts(query, iteration)
-            
-            # Update phase: inference
-            await database.update_run(
-                run_id=run_id,
-                current_phase="inference",
-                updated_at=datetime.utcnow(),
-            )
-            
-            # Submit Batch job and wait for completion
-            predictions = await orchestrator.run_inference(
-                run_id=run_id,
-                iteration=iteration,
-                prompt_cells=prompt_cells,
-            )
-            
-            # Check for cancellation again after long inference
-            run = await database.get_run(run_id)
-            if run["status"] == "cancelled":
-                await email_service.send_run_cancelled(
-                    recipient_email=user_email,
-                    run_id=run_id,
-                    query=query,
-                )
-                return
-            
-            # Update phase: evaluation
-            await database.update_run(
-                run_id=run_id,
-                current_phase="evaluation",
-                updated_at=datetime.utcnow(),
-            )
-            
-            # Evaluate predictions
-            grounding_result = await orchestrator.evaluate_predictions(predictions)
-            score = grounding_result.score
-            
-            # Update grounding scores
-            scores = run.get("grounding_scores", [])
-            scores.append(score)
-            await database.update_run(
-                run_id=run_id,
-                grounding_scores=scores,
-                updated_at=datetime.utcnow(),
-            )
-            
-            # Check convergence
-            if score >= score_threshold:
-                logger.info(f"Run {run_id} converged with score {score}")
-                break
-        
-        # Update phase: output generation
-        await database.update_run(
-            run_id=run_id,
-            current_phase="output_generation",
-            updated_at=datetime.utcnow(),
-        )
-        
-        # Generate final outputs
-        output_paths = await orchestrator.generate_outputs(run_id)
-        
-        # Mark as completed
-        final_score = scores[-1] if scores else 0
-        await database.update_run(
-            run_id=run_id,
-            status="completed",
-            current_phase=None,
-            final_score=final_score,
-            output_anndata_path=output_paths["anndata"],
-            output_report_path=output_paths["report"],
-            output_log_path=output_paths["log"],
-            completed_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        )
-        
-        # Send completion email
-        await email_service.send_run_completed(
-            recipient_email=user_email,
-            run_id=run_id,
-            query=query,
-            grounding_score=final_score,
-        )
-        
-        logger.info(f"Run {run_id} completed successfully with score {final_score}")
-        
-    except Exception as e:
-        logger.error(f"Run {run_id} failed: {e}")
-        
-        # Update status to failed
-        await database.update_run(
-            run_id=run_id,
-            status="failed",
-            error_message=str(e),
-            updated_at=datetime.utcnow(),
-        )
-        
-        # Send failure email
-        run = await database.get_run(run_id)
-        await email_service.send_run_failed(
-            recipient_email=run["user_email"],
-            run_id=run_id,
-            query=query,
-            error_message=str(e),
-        )
-```
-
 ---
 
-## 10. Frontend Specification
+## 11. Frontend Specification
 
 ### 10.1 Project Structure
 
@@ -2531,13 +2877,27 @@ default:
   # GCP Batch configuration for STACK inference
   batch:
     region: "us-east1"
-    job_timeout_seconds: 1800  # 30 minutes max
-    poll_interval_seconds: 10
-    machine_type: "a2-highgpu-1g"  # NVIDIA A100 80GB
-    accelerator_type: "nvidia-tesla-a100"
-    accelerator_count: 1
-    boot_disk_size_gb: 200
-    container_image: "us-east1-docker.pkg.dev/arc-prod/haystack/stack-inference:latest"
+  # GCP Batch configuration
+  batch:
+    region: "us-east1"
+    
+    # CPU Orchestrator job (runs the agent workflow)
+    orchestrator:
+      machine_type: "e2-standard-4"  # 4 vCPU, 16 GB RAM
+      job_timeout_seconds: 7200      # 2 hours max
+      container_image: "us-east1-docker.pkg.dev/arc-prod/haystack/orchestrator:latest"
+      service_account: "haystack-orchestrator-sa@arc-prod.iam.gserviceaccount.com"
+    
+    # GPU Inference job (STACK model)
+    inference:
+      machine_type: "a2-highgpu-1g"  # NVIDIA A100 80GB
+      accelerator_type: "nvidia-tesla-a100"
+      accelerator_count: 1
+      boot_disk_size_gb: 200
+      job_timeout_seconds: 1800      # 30 minutes max
+      poll_interval_seconds: 10
+      container_image: "us-east1-docker.pkg.dev/arc-prod/haystack/inference:latest"
+      service_account: "haystack-inference-sa@arc-prod.iam.gserviceaccount.com"
   
   # Email notifications
   email:
@@ -2563,10 +2923,15 @@ dev:
     atlases_prefix: "atlases/"
     stack_model_prefix: "models/stack/"
     results_prefix: "results/"
-    batch_io_prefix: "batch-io/"  # For Batch job input/output
+    batch_io_prefix: "batch-io/"
   
   batch:
-    container_image: "us-east1-docker.pkg.dev/arc-dev/haystack/stack-inference:latest"
+    orchestrator:
+      container_image: "us-east1-docker.pkg.dev/arc-dev/haystack/orchestrator:latest"
+      service_account: "haystack-orchestrator-sa@arc-dev.iam.gserviceaccount.com"
+    inference:
+      container_image: "us-east1-docker.pkg.dev/arc-dev/haystack/inference:latest"
+      service_account: "haystack-inference-sa@arc-dev.iam.gserviceaccount.com"
 
 prod:
   database:
@@ -2618,10 +2983,16 @@ PORT=8080
 
 ## 12. Deployment
 
-### 12.1 Docker Configuration (Web Application)
+HAYSTACK uses three separate containers:
+1. **API Container** — Cloud Run (thin API layer + frontend)
+2. **Orchestrator Container** — CPU Batch job (agent workflow)
+3. **Inference Container** — GPU Batch job (STACK model)
+
+### 12.1 API Container (Cloud Run)
 
 ```dockerfile
-# Dockerfile (Cloud Run web application)
+# docker/Dockerfile.api
+# Cloud Run API + frontend serving
 
 # Stage 1: Build frontend
 FROM node:20-alpine AS frontend-build
@@ -2632,8 +3003,39 @@ COPY frontend ./
 RUN rm -f .env .env.* || true
 RUN npm run build
 
-# Stage 2: Python runtime
-FROM python:3.11-slim AS backend
+# Stage 2: Python API
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install API dependencies
+COPY api /app/api
+COPY shared /app/shared
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir -e ".[api]"
+
+# Copy built frontend
+COPY --from=frontend-build /app/frontend/out /app/frontend/out
+
+# Runtime configuration
+ENV FRONTEND_OUT_DIR=/app/frontend/out PORT=8080
+
+EXPOSE 8080
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+### 12.2 Orchestrator Container (CPU Batch)
+
+```dockerfile
+# docker/Dockerfile.orchestrator
+# CPU Batch job for agent workflow
+
+FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app
 WORKDIR /app
 
@@ -2643,24 +3045,21 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies
-COPY backend /app/backend
-RUN pip install --no-cache-dir -e /app/backend/.
+# Copy and install orchestrator dependencies
+COPY orchestrator /app/orchestrator
+COPY shared /app/shared
+COPY pyproject.toml /app/
+RUN pip install --no-cache-dir -e ".[orchestrator]"
 
-# Copy built frontend
-COPY --from=frontend-build /app/frontend/out /app/frontend/out
-
-# Set runtime environment
-ENV FRONTEND_OUT_DIR=/app/frontend/out PORT=8080
-
-EXPOSE 8080
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Entrypoint
+CMD ["python", "-m", "orchestrator.main"]
 ```
 
-### 12.2 Docker Configuration (STACK Inference)
+### 12.3 Inference Container (GPU Batch)
 
 ```dockerfile
-# Dockerfile.stack (GCP Batch inference container)
+# docker/Dockerfile.inference
+# GPU Batch job for STACK inference
 
 # Base image with CUDA support
 FROM nvcr.io/nvidia/pytorch:24.01-py3
@@ -2685,13 +3084,13 @@ RUN pip install --no-cache-dir \
     anndata>=0.10.0
 
 # Copy inference script
-COPY stack_inference/run_inference.py /app/run_inference.py
+COPY inference /app/inference
 
 WORKDIR /app
-ENTRYPOINT ["python", "/app/run_inference.py"]
+ENTRYPOINT ["python", "-m", "inference.run_inference"]
 ```
 
-### 12.3 STACK Inference Script
+### 12.4 STACK Inference Script
 
 ```python
 # stack_inference/run_inference.py
