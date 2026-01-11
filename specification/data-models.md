@@ -70,7 +70,7 @@ class PromptCandidate(BaseModel):
         "donor_context",
         "tissue_atlas",
     ]
-    cell_group_ids: list[str] = Field(description="Selected cell groups for prompt")
+    prompt_cell_indices: list[int] = Field(description="Selected cell indices for prompt")
     
     # Metadata for ranking
     similarity_score: Optional[float] = None

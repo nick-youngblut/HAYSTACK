@@ -283,8 +283,9 @@ class TestOntologyGuidedStrategy:
             }
             
             mock_db.execute_query.return_value = [
-                {"group_id": "g1", "dataset": "parse_pbmc", "cell_type_cl_id": "CL:0000548",
-                 "cell_type_name": "animal cell", "perturbation_name": "TGF-beta", "n_cells": 100}
+                {"dataset": "parse_pbmc", "cell_type_cl_id": "CL:0000548",
+                 "cell_type_name": "animal cell", "perturbation_name": "TGF-beta",
+                 "cell_indices": [1, 2, 3], "n_cells": 3}
             ]
             
             query = StructuredQuery(

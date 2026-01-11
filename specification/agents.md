@@ -356,7 +356,7 @@ Final score = 0.5 * relevance + 0.3 * diversity + 0.2 * quality
 ## OUTPUT
 
 Return a PromptConfiguration with:
-- Selected prompt cell groups (group_id, cell_indices)
+- Selected prompt cell sets (selection criteria, cell_indices)
 - Strategy used for each group
 - Combined relevance score
 - Rationale for selection

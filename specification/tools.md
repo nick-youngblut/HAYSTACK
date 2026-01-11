@@ -26,7 +26,7 @@ async def search_cells_by_perturbation(
         limit: Maximum results to return
     
     Returns:
-        List of cell groups matching criteria
+        List of cell sets matching criteria
     """
     ...
 
@@ -46,7 +46,7 @@ async def search_cells_by_cell_type(
         limit: Maximum results to return
     
     Returns:
-        List of cell groups matching criteria
+        List of cell sets matching criteria
     """
     ...
 
@@ -68,7 +68,7 @@ async def search_cells_by_donor(
         limit: Maximum results to return
     
     Returns:
-        List of cell groups matching criteria
+        List of cell sets matching criteria
     """
     ...
 
@@ -90,7 +90,7 @@ async def semantic_search_cells(
         similarity_threshold: Minimum cosine similarity
     
     Returns:
-        List of cell groups with similarity scores
+        List of cell sets with similarity scores
     """
     ...
 
@@ -110,7 +110,7 @@ async def find_ontology_related_cells(
         perturbation_filter: Optional perturbation filter
     
     Returns:
-        List of cell groups with ontology distance
+        List of cell sets with ontology distance
     """
     ...
 
@@ -123,7 +123,7 @@ async def find_donor_cells(
     limit: int = 100,
 ) -> list[dict]:
     """
-    Find cell groups for a specific donor with optional filters.
+    Find cell sets for a specific donor with optional filters.
     
     Args:
         donor_id: Donor identifier (prefixed with dataset)
@@ -132,7 +132,7 @@ async def find_donor_cells(
         limit: Maximum results to return
     
     Returns:
-        List of cell groups for the donor
+        List of cell sets for the donor
     """
     ...
 
@@ -145,7 +145,7 @@ async def find_reference_cells(
     max_results: int = 50,
 ) -> list[dict]:
     """
-    Find reference cell groups for observational tasks.
+    Find reference cell sets for observational tasks.
     
     Args:
         cell_type_cl_id: Target Cell Ontology ID
@@ -154,7 +154,7 @@ async def find_reference_cells(
         max_results: Max results to return
     
     Returns:
-        List of reference cell groups with relevance scores
+        List of reference cell sets with relevance scores
     """
     ...
 
@@ -168,7 +168,7 @@ async def find_donor_context_cells(
     max_results: int = 50,
 ) -> list[dict]:
     """
-    Find cell groups from donors with similar clinical context.
+    Find cell sets from donors with similar clinical context.
     
     Args:
         cell_type_cl_id: Target cell type CL ID
@@ -178,7 +178,7 @@ async def find_donor_context_cells(
         max_results: Max results to return
     
     Returns:
-        List of cell groups with donor similarity scores
+        List of cell sets with donor similarity scores
     """
     ...
 
@@ -190,7 +190,7 @@ async def find_tissue_atlas_cells(
     max_results: int = 50,
 ) -> list[dict]:
     """
-    Find high-quality reference cell groups from tissue atlases.
+    Find high-quality reference cell sets from tissue atlases.
     
     Args:
         cell_type_cl_id: Target cell type CL ID
@@ -198,7 +198,7 @@ async def find_tissue_atlas_cells(
         max_results: Max results to return
     
     Returns:
-        List of reference cell groups ranked by atlas priority and cell count
+        List of reference cell sets ranked by atlas priority and cell count
     """
     ...
 ```
@@ -503,8 +503,8 @@ async def find_mechanistically_similar_perturbations(
 ```python
 @tool
 async def run_stack_inference(
-    prompt_cell_group_ids: list[str],
-    query_cell_group_ids: list[str],
+    prompt_cell_indices: list[int],
+    query_cell_indices: list[int],
     run_id: str,
     iteration: int,
     progress_callback: Optional[Callable] = None,
@@ -513,8 +513,8 @@ async def run_stack_inference(
     Run STACK inference with selected prompt and query cells.
     
     Args:
-        prompt_cell_group_ids: Cell group IDs for prompt
-        query_cell_group_ids: Cell group IDs for query
+        prompt_cell_indices: Cell indices for prompt
+        query_cell_indices: Cell indices for query
         run_id: Current run ID
         iteration: Current iteration number
         progress_callback: Optional callback for progress updates

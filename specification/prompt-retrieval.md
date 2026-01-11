@@ -44,7 +44,7 @@ Given a natural language query (e.g., "How would lung fibroblasts respond to TGF
 | Multiple embeddings per cell | Yes (text-based) | Enables semantic similarity search for perturbations, cell types, and sample context |
 | Strategy chaining | Yes | Higher-level strategies (Mechanistic, Ontology, Donor Context) produce filters; lower-level strategies (Direct, Semantic, Tissue Atlas) retrieve cells |
 | Metadata harmonization | Pre-indexed | Harmonization happens at index build time, not query time |
-| Retrieval granularity | Cell groups | Return groups of cells sharing (perturbation, cell_type, donor), not individual cells |
+| Retrieval granularity | Cell sets (query-time) | Return dynamically aggregated cell sets based on selection criteria, not precomputed groups |
 
 ### 1.3 Strategy Hierarchy
 
@@ -84,12 +84,12 @@ Given a natural language query (e.g., "How would lung fibroblasts respond to TGF
 │  │   │   pert + cell   │         │   text          │               │    │
 │  │   │   type          │         │ Output: similar │               │    │
 │  │   │ Output: cell    │         │   cells by      │               │    │
-│  │   │   groups        │         │   embedding     │               │    │
+│  │   │   sets          │         │   embedding     │               │    │
 │  │   └────────┬────────┘         └────────┬────────┘               │    │
 │  │            │                           │                        │    │
 │  │            └───────────┬───────────────┘                        │    │
 │  │                        ▼                                        │    │
-│  │                 Cell Group                                      │    │
+│  │                 Cell Set                                        │    │
 │  │                 Candidates                                      │    │
 │  │                                                                 │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
@@ -100,7 +100,7 @@ Given a natural language query (e.g., "How would lung fibroblasts respond to TGF
 │  │                                                                 │    │
 │  │   Score = w1*relevance + w2*diversity + w3*quality              │    │
 │  │                                                                 │    │
-│  │   → Select top K cell groups for prompt                         │    │
+│  │   → Select top K cell sets for prompt                            │    │
 │  │                                                                 │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
@@ -179,40 +179,49 @@ class HarmonizedCellMetadata(BaseModel):
     sample_metadata: dict[str, str] = Field(default_factory=dict, description="Additional metadata")
 ```
 
-### 2.2 Cell Groups
+### 2.2 Cell Sets (Query-Time Aggregation)
 
-Cells are grouped for retrieval efficiency. A group contains cells that share the same (perturbation, cell_type, donor), with observational metadata (tissue, disease, condition) stored at the group level.
+Cells are not pre-grouped in storage. Retrieval returns dynamic cell sets based on the selection criteria appropriate for the task (e.g., perturbation + cell type + donor, or tissue + cell type). Sets are aggregated at query time from the `cells` table.
 
 ```python
-class CellGroup(BaseModel):
-    """A group of cells that can serve as a prompt unit."""
+class CellSetCandidate(BaseModel):
+    """A candidate set of cells for prompt construction."""
     
-    group_id: str = Field(description="Unique group identifier")
-    
-    # Defining attributes (cells in group share these)
+    # Identifying criteria (how this set was selected)
     dataset: str
-    perturbation_name: Optional[str]
-    cell_type_cl_id: Optional[str]
-    donor_id: str
+    perturbation_name: Optional[str] = None
+    cell_type_cl_id: Optional[str] = None
+    cell_type_name: Optional[str] = None
+    donor_id: Optional[str] = None
     tissue_uberon_id: Optional[str] = None
-    tissue_name: Optional[str] = None
     disease_mondo_id: Optional[str] = None
-    disease_name: Optional[str] = None
     sample_condition: Optional[str] = None
     sample_metadata: dict[str, str] = Field(default_factory=dict)
-    is_reference_sample: bool = False
     
-    # Group statistics
-    n_cells: int
+    # Cell indices (the actual cells)
     cell_indices: list[int] = Field(description="Indices into atlas H5AD file")
+    n_cells: int
     
     # Aggregated metadata
-    mean_n_genes: float
-    mean_total_counts: float
+    mean_n_genes: Optional[float] = None
+    mean_total_counts: Optional[float] = None
     
-    # For retrieval
-    has_control: bool = Field(description="Whether matching control cells exist")
-    control_group_id: Optional[str] = Field(description="ID of corresponding control group")
+    # Strategy metadata
+    strategy: str
+    relevance_score: float = Field(ge=0, le=1)
+    rationale: Optional[str] = None
+    
+    def selection_key(self) -> tuple:
+        """Deduplicate by selection criteria instead of precomputed IDs."""
+        return (
+            self.dataset,
+            self.perturbation_name,
+            self.cell_type_cl_id,
+            self.donor_id,
+            self.tissue_uberon_id,
+            self.disease_mondo_id,
+            self.sample_condition,
+        )
 ```
 
 ### 2.3 Dataset-Specific Harmonization Rules
@@ -359,7 +368,6 @@ CREATE TABLE cells (
     
     -- Identifiers
     cell_index INT NOT NULL,
-    group_id VARCHAR(64) NOT NULL,
     dataset VARCHAR(32) NOT NULL,
     
     -- Cell type (harmonized)
@@ -398,39 +406,6 @@ CREATE TABLE cells (
     sample_context_embedding vector(1536),
     
     -- Timestamps
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Cell groups table (aggregated view for retrieval)
-CREATE TABLE cell_groups (
-    group_id VARCHAR(64) PRIMARY KEY,
-    dataset VARCHAR(32) NOT NULL,
-    perturbation_name VARCHAR(256),
-    cell_type_cl_id VARCHAR(32),
-    cell_type_name VARCHAR(256),
-    donor_id VARCHAR(64),
-    tissue_uberon_id VARCHAR(32),
-    tissue_name VARCHAR(256),
-    disease_mondo_id VARCHAR(32),
-    disease_name VARCHAR(256),
-    sample_condition VARCHAR(256),
-    sample_metadata JSONB DEFAULT '{}',
-    is_reference_sample BOOLEAN DEFAULT FALSE,
-    
-    n_cells INT NOT NULL,
-    cell_indices INT[] NOT NULL,
-    
-    mean_n_genes FLOAT,
-    mean_total_counts FLOAT,
-    
-    has_control BOOLEAN DEFAULT FALSE,
-    control_group_id VARCHAR(64),
-    
-    -- Representative embeddings (mean of cells in group)
-    perturbation_embedding vector(1536),
-    cell_type_embedding vector(1536),
-    sample_context_embedding vector(1536),
-    
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -513,10 +488,12 @@ CREATE INDEX idx_cells_cell_type ON cells(cell_type_cl_id);
 CREATE INDEX idx_cells_perturbation ON cells(perturbation_name);
 CREATE INDEX idx_cells_tissue ON cells(tissue_uberon_id);
 CREATE INDEX idx_cells_is_control ON cells(is_control);
-CREATE INDEX idx_cells_group ON cells(group_id);
 CREATE INDEX idx_cells_donor ON cells(donor_id);
 CREATE INDEX idx_cells_disease ON cells(disease_mondo_id);
 CREATE INDEX idx_cells_condition ON cells(sample_condition);
+CREATE INDEX idx_cells_pert_ct_donor ON cells(perturbation_name, cell_type_cl_id, donor_id);
+CREATE INDEX idx_cells_tissue_ct ON cells(tissue_uberon_id, cell_type_cl_id);
+CREATE INDEX idx_cells_donor_ct ON cells(donor_id, cell_type_cl_id);
 
 -- HNSW vector indexes for similarity search
 -- Note: Build these AFTER loading data for best performance
@@ -526,19 +503,6 @@ WITH (m = 16, ef_construction = 64);
 
 CREATE INDEX idx_cells_cell_type_embedding ON cells 
 USING hnsw (cell_type_embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
--- Group-level vector indexes
-CREATE INDEX idx_groups_perturbation_embedding ON cell_groups
-USING hnsw (perturbation_embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
-CREATE INDEX idx_groups_cell_type_embedding ON cell_groups
-USING hnsw (cell_type_embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
-CREATE INDEX idx_groups_sample_context_embedding ON cell_groups
-USING hnsw (sample_context_embedding vector_cosine_ops)
 WITH (m = 16, ef_construction = 64);
 
 -- Index on synonym table
@@ -587,17 +551,17 @@ class RetrievalStrategy(ABC):
         query: StructuredQuery,
         max_results: int = 50,
         filters: Optional[dict] = None,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """
-        Retrieve cell group candidates for a query.
+        Retrieve cell set candidates for a query.
         
         Args:
             query: Parsed user query with resolved entities
-            max_results: Maximum cell groups to return
+            max_results: Maximum cell sets to return
             filters: Additional SQL filters
         
         Returns:
-            List of cell group candidates with scores
+            List of cell set candidates with scores
         """
         pass
     
@@ -608,27 +572,7 @@ class RetrievalStrategy(ABC):
         pass
 
 
-class CellGroupCandidate(BaseModel):
-    """A candidate cell group with retrieval metadata."""
-    
-    group_id: str
-    dataset: str
-    perturbation_name: Optional[str]
-    cell_type_cl_id: Optional[str]
-    cell_type_name: Optional[str]
-    donor_id: Optional[str] = None
-    n_cells: int
-    
-    # Strategy-specific scores
-    strategy: str
-    relevance_score: float = Field(ge=0, le=1)
-    
-    # Explanation
-    rationale: str
-    
-    # Additional metadata for ranking
-    has_control: bool = False
-    control_group_id: Optional[str] = None
+Use the `CellSetCandidate` model from Section 2.2 for all strategies.
 ```
 
 ### 4.2 Strategy Orchestration
@@ -663,7 +607,7 @@ async def execute_strategy_pipeline(
     query: StructuredQuery,
     db: HaystackDatabase,
     max_results: int = 50,
-) -> list[CellGroupCandidate]:
+) -> list[CellSetCandidate]:
     """
     Execute retrieval strategies in priority order.
     
@@ -675,7 +619,7 @@ async def execute_strategy_pipeline(
         strategies = OBSERVATIONAL_STRATEGY_PRIORITY
     
     all_candidates = []
-    seen_groups = set()
+    seen_keys = set()
     
     for strategy_cls in strategies:
         strategy = strategy_cls(db)
@@ -683,13 +627,14 @@ async def execute_strategy_pipeline(
         candidates = await strategy.retrieve(
             query=query,
             max_results=max_results - len(all_candidates),
-            filters={"exclude_groups": seen_groups},
+            filters={"exclude_keys": seen_keys},
         )
         
         for candidate in candidates:
-            if candidate.group_id not in seen_groups:
+            key = candidate.selection_key()
+            if key not in seen_keys:
                 all_candidates.append(candidate)
-                seen_groups.add(candidate.group_id)
+                seen_keys.add(key)
         
         logger.info(
             f"Strategy {strategy.strategy_name}: "
@@ -726,9 +671,9 @@ class DirectMatchStrategy(RetrievalStrategy):
         query: StructuredQuery,
         max_results: int = 50,
         filters: Optional[dict] = None,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """
-        Find cell groups matching query perturbation and cell type.
+        Find cell sets matching query perturbation and cell type.
         
         Strategy:
         1. Try exact match on perturbation_name AND cell_type_cl_id
@@ -752,7 +697,7 @@ class DirectMatchStrategy(RetrievalStrategy):
                 perturbation_query=query.perturbation_query,
                 cell_type_query=query.cell_type_query,
                 max_results=max_results - len(candidates),
-                exclude_groups={c.group_id for c in candidates},
+                exclude_keys={c.selection_key() for c in candidates},
             )
             candidates.extend(fuzzy_matches)
         
@@ -761,51 +706,63 @@ class DirectMatchStrategy(RetrievalStrategy):
             partial_matches = await self._partial_match(
                 query=query,
                 max_results=max_results - len(candidates),
-                exclude_groups={c.group_id for c in candidates},
+                exclude_keys={c.selection_key() for c in candidates},
             )
             candidates.extend(partial_matches)
         
-        return candidates
+        return candidates[:max_results]
     
     async def _exact_match(
         self,
         perturbation: str,
         cell_type_cl_id: str,
         max_results: int,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """Find exact matches."""
         sql = """
             SELECT 
-                g.group_id,
-                g.dataset,
-                g.perturbation_name,
-                g.cell_type_cl_id,
-                g.cell_type_name,
-                g.n_cells,
-                g.has_control,
-                g.control_group_id
-            FROM cell_groups g
-            WHERE g.perturbation_name = $1
-              AND g.cell_type_cl_id = $2
-            ORDER BY g.n_cells DESC
+                dataset,
+                perturbation_name,
+                cell_type_cl_id,
+                cell_type_name,
+                donor_id,
+                tissue_uberon_id,
+                disease_mondo_id,
+                sample_condition,
+                sample_metadata,
+                ARRAY_AGG(cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(n_genes) AS mean_n_genes,
+                AVG(total_counts) AS mean_total_counts
+            FROM cells
+            WHERE perturbation_name = $1
+              AND cell_type_cl_id = $2
+            GROUP BY dataset, perturbation_name, cell_type_cl_id, cell_type_name,
+                     donor_id, tissue_uberon_id, disease_mondo_id, sample_condition, sample_metadata
+            ORDER BY n_cells DESC
             LIMIT $3
         """
         
         rows = await self.db.execute_query(sql, (perturbation, cell_type_cl_id, max_results))
         
         return [
-            CellGroupCandidate(
-                group_id=row["group_id"],
+            CellSetCandidate(
                 dataset=row["dataset"],
                 perturbation_name=row["perturbation_name"],
                 cell_type_cl_id=row["cell_type_cl_id"],
                 cell_type_name=row["cell_type_name"],
+                donor_id=row["donor_id"],
+                tissue_uberon_id=row["tissue_uberon_id"],
+                disease_mondo_id=row["disease_mondo_id"],
+                sample_condition=row["sample_condition"],
+                sample_metadata=row["sample_metadata"],
+                cell_indices=row["cell_indices"],
                 n_cells=row["n_cells"],
+                mean_n_genes=row["mean_n_genes"],
+                mean_total_counts=row["mean_total_counts"],
                 strategy="direct",
                 relevance_score=1.0,
                 rationale=f"Exact match: {perturbation} in {row['cell_type_name']}",
-                has_control=row["has_control"],
-                control_group_id=row["control_group_id"],
             )
             for row in rows
         ]
@@ -815,8 +772,8 @@ class DirectMatchStrategy(RetrievalStrategy):
         perturbation_query: str,
         cell_type_query: str,
         max_results: int,
-        exclude_groups: set[str],
-    ) -> list[CellGroupCandidate]:
+        exclude_keys: set[tuple],
+    ) -> list[CellSetCandidate]:
         """Find matches via synonym lookup."""
         # Resolve synonyms
         pert_canonical = await self._resolve_synonym(perturbation_query, "perturbation")
@@ -827,43 +784,56 @@ class DirectMatchStrategy(RetrievalStrategy):
         
         sql = """
             SELECT 
-                g.group_id,
-                g.dataset,
-                g.perturbation_name,
-                g.cell_type_cl_id,
-                g.cell_type_name,
-                g.n_cells,
-                g.has_control,
-                g.control_group_id
-            FROM cell_groups g
-            WHERE ($1::text IS NULL OR g.perturbation_name = $1)
-              AND ($2::text IS NULL OR g.cell_type_cl_id = $2)
-              AND g.group_id != ALL($3)
-            ORDER BY g.n_cells DESC
+                dataset,
+                perturbation_name,
+                cell_type_cl_id,
+                cell_type_name,
+                donor_id,
+                tissue_uberon_id,
+                disease_mondo_id,
+                sample_condition,
+                sample_metadata,
+                ARRAY_AGG(cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(n_genes) AS mean_n_genes,
+                AVG(total_counts) AS mean_total_counts
+            FROM cells
+            WHERE ($1::text IS NULL OR perturbation_name = $1)
+              AND ($2::text IS NULL OR cell_type_cl_id = $2)
+            GROUP BY dataset, perturbation_name, cell_type_cl_id, cell_type_name,
+                     donor_id, tissue_uberon_id, disease_mondo_id, sample_condition, sample_metadata
+            ORDER BY n_cells DESC
             LIMIT $4
         """
         
         rows = await self.db.execute_query(
             sql, 
-            (pert_canonical, ct_canonical, list(exclude_groups), max_results)
+            (pert_canonical, ct_canonical, max_results)
         )
         
-        return [
-            CellGroupCandidate(
-                group_id=row["group_id"],
+        candidates = [
+            CellSetCandidate(
                 dataset=row["dataset"],
                 perturbation_name=row["perturbation_name"],
                 cell_type_cl_id=row["cell_type_cl_id"],
                 cell_type_name=row["cell_type_name"],
+                donor_id=row["donor_id"],
+                tissue_uberon_id=row["tissue_uberon_id"],
+                disease_mondo_id=row["disease_mondo_id"],
+                sample_condition=row["sample_condition"],
+                sample_metadata=row["sample_metadata"],
+                cell_indices=row["cell_indices"],
                 n_cells=row["n_cells"],
+                mean_n_genes=row["mean_n_genes"],
+                mean_total_counts=row["mean_total_counts"],
                 strategy="direct",
                 relevance_score=0.9,
                 rationale=f"Fuzzy match via synonym: {perturbation_query} → {pert_canonical}",
-                has_control=row["has_control"],
-                control_group_id=row["control_group_id"],
             )
             for row in rows
         ]
+        
+        return [c for c in candidates if c.selection_key() not in exclude_keys][:max_results]
     
     async def _resolve_synonym(
         self,
@@ -905,15 +875,15 @@ class MechanisticMatchStrategy(RetrievalStrategy):
         query: StructuredQuery,
         max_results: int = 50,
         filters: Optional[dict] = None,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """
-        Find cell groups with perturbations sharing targets/pathways.
+        Find cell sets with perturbations sharing targets/pathways.
         
         Strategy:
         1. Get expected targets and pathways from query
         2. Find perturbations in atlas that share targets
         3. Find perturbations in atlas that share pathways
-        4. Score by overlap and retrieve cell groups
+        4. Score by overlap and retrieve cell sets
         """
         if not query.expected_targets and not query.expected_pathways:
             return []
@@ -935,7 +905,7 @@ class MechanisticMatchStrategy(RetrievalStrategy):
                 pathways=query.expected_pathways,
                 cell_type_cl_id=query.cell_type_cl_id,
                 max_results=max_results // 2,
-                exclude_groups={c.group_id for c in candidates},
+                exclude_keys={c.selection_key() for c in candidates},
             )
             candidates.extend(pathway_matches)
         
@@ -946,7 +916,7 @@ class MechanisticMatchStrategy(RetrievalStrategy):
         targets: list[str],
         cell_type_cl_id: Optional[str],
         max_results: int,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """Find perturbations sharing target genes."""
         sql = """
             WITH target_overlap AS (
@@ -962,38 +932,51 @@ class MechanisticMatchStrategy(RetrievalStrategy):
                 WHERE p.targets && $1::text[]
             )
             SELECT 
-                g.group_id,
-                g.dataset,
-                g.perturbation_name,
-                g.cell_type_cl_id,
-                g.cell_type_name,
-                g.n_cells,
-                g.has_control,
-                g.control_group_id,
+                c.dataset,
+                c.perturbation_name,
+                c.cell_type_cl_id,
+                c.cell_type_name,
+                c.donor_id,
+                c.tissue_uberon_id,
+                c.disease_mondo_id,
+                c.sample_condition,
+                c.sample_metadata,
+                ARRAY_AGG(c.cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(c.n_genes) AS mean_n_genes,
+                AVG(c.total_counts) AS mean_total_counts,
                 t.overlap_count,
                 t.total_targets
-            FROM cell_groups g
-            JOIN target_overlap t ON g.perturbation_name = t.perturbation_name
-            WHERE ($2::text IS NULL OR g.cell_type_cl_id = $2)
-            ORDER BY t.overlap_count DESC, g.n_cells DESC
+            FROM cells c
+            JOIN target_overlap t ON c.perturbation_name = t.perturbation_name
+            WHERE ($2::text IS NULL OR c.cell_type_cl_id = $2)
+            GROUP BY c.dataset, c.perturbation_name, c.cell_type_cl_id, c.cell_type_name,
+                     c.donor_id, c.tissue_uberon_id, c.disease_mondo_id,
+                     c.sample_condition, c.sample_metadata, t.overlap_count, t.total_targets
+            ORDER BY t.overlap_count DESC, n_cells DESC
             LIMIT $3
         """
         
         rows = await self.db.execute_query(sql, (targets, cell_type_cl_id, max_results))
         
         return [
-            CellGroupCandidate(
-                group_id=row["group_id"],
+            CellSetCandidate(
                 dataset=row["dataset"],
                 perturbation_name=row["perturbation_name"],
                 cell_type_cl_id=row["cell_type_cl_id"],
                 cell_type_name=row["cell_type_name"],
+                donor_id=row["donor_id"],
+                tissue_uberon_id=row["tissue_uberon_id"],
+                disease_mondo_id=row["disease_mondo_id"],
+                sample_condition=row["sample_condition"],
+                sample_metadata=row["sample_metadata"],
+                cell_indices=row["cell_indices"],
                 n_cells=row["n_cells"],
+                mean_n_genes=row["mean_n_genes"],
+                mean_total_counts=row["mean_total_counts"],
                 strategy="mechanistic",
                 relevance_score=min(1.0, row["overlap_count"] / len(targets)),
                 rationale=f"Shares {row['overlap_count']}/{row['total_targets']} targets",
-                has_control=row["has_control"],
-                control_group_id=row["control_group_id"],
             )
             for row in rows
         ]
@@ -1003,8 +986,8 @@ class MechanisticMatchStrategy(RetrievalStrategy):
         pathways: list[str],
         cell_type_cl_id: Optional[str],
         max_results: int,
-        exclude_groups: set[str],
-    ) -> list[CellGroupCandidate]:
+        exclude_keys: set[tuple],
+    ) -> list[CellSetCandidate]:
         """Find perturbations sharing pathway annotations."""
         sql = """
             WITH pathway_overlap AS (
@@ -1017,44 +1000,58 @@ class MechanisticMatchStrategy(RetrievalStrategy):
                 WHERE p.pathways && $1::text[]
             )
             SELECT 
-                g.group_id,
-                g.dataset,
-                g.perturbation_name,
-                g.cell_type_cl_id,
-                g.cell_type_name,
-                g.n_cells,
-                g.has_control,
-                g.control_group_id,
+                c.dataset,
+                c.perturbation_name,
+                c.cell_type_cl_id,
+                c.cell_type_name,
+                c.donor_id,
+                c.tissue_uberon_id,
+                c.disease_mondo_id,
+                c.sample_condition,
+                c.sample_metadata,
+                ARRAY_AGG(c.cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(c.n_genes) AS mean_n_genes,
+                AVG(c.total_counts) AS mean_total_counts,
                 po.overlap_count
-            FROM cell_groups g
-            JOIN pathway_overlap po ON g.perturbation_name = po.perturbation_name
-            WHERE ($2::text IS NULL OR g.cell_type_cl_id = $2)
-              AND g.group_id != ALL($3)
-            ORDER BY po.overlap_count DESC, g.n_cells DESC
+            FROM cells c
+            JOIN pathway_overlap po ON c.perturbation_name = po.perturbation_name
+            WHERE ($2::text IS NULL OR c.cell_type_cl_id = $2)
+            GROUP BY c.dataset, c.perturbation_name, c.cell_type_cl_id, c.cell_type_name,
+                     c.donor_id, c.tissue_uberon_id, c.disease_mondo_id,
+                     c.sample_condition, c.sample_metadata, po.overlap_count
+            ORDER BY po.overlap_count DESC, n_cells DESC
             LIMIT $4
         """
         
         rows = await self.db.execute_query(
             sql, 
-            (pathways, cell_type_cl_id, list(exclude_groups), max_results)
+            (pathways, cell_type_cl_id, max_results)
         )
         
-        return [
-            CellGroupCandidate(
-                group_id=row["group_id"],
+        candidates = [
+            CellSetCandidate(
                 dataset=row["dataset"],
                 perturbation_name=row["perturbation_name"],
                 cell_type_cl_id=row["cell_type_cl_id"],
                 cell_type_name=row["cell_type_name"],
+                donor_id=row["donor_id"],
+                tissue_uberon_id=row["tissue_uberon_id"],
+                disease_mondo_id=row["disease_mondo_id"],
+                sample_condition=row["sample_condition"],
+                sample_metadata=row["sample_metadata"],
+                cell_indices=row["cell_indices"],
                 n_cells=row["n_cells"],
+                mean_n_genes=row["mean_n_genes"],
+                mean_total_counts=row["mean_total_counts"],
                 strategy="mechanistic",
                 relevance_score=min(1.0, row["overlap_count"] / len(pathways)),
                 rationale=f"Shares {row['overlap_count']}/{len(pathways)} pathways",
-                has_control=row["has_control"],
-                control_group_id=row["control_group_id"],
             )
             for row in rows
         ]
+        
+        return [c for c in candidates if c.selection_key() not in exclude_keys][:max_results]
 ```
 
 ### 6.3 Literature Enrichment (Optional)
@@ -1102,9 +1099,9 @@ class SemanticMatchStrategy(RetrievalStrategy):
         query: StructuredQuery,
         max_results: int = 50,
         filters: Optional[dict] = None,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """
-        Find cell groups via vector similarity.
+        Find cell sets via vector similarity.
         
         Strategy:
         1. Generate embedding for perturbation query (perturbational tasks)
@@ -1138,7 +1135,7 @@ class SemanticMatchStrategy(RetrievalStrategy):
                 search_type="cell_type",
                 perturbation_filter=query.perturbation_resolved,
                 max_results=max_results // 2,
-                exclude_groups={c.group_id for c in candidates},
+                exclude_keys={c.selection_key() for c in candidates},
             )
             candidates.extend(ct_matches)
         
@@ -1155,11 +1152,11 @@ class SemanticMatchStrategy(RetrievalStrategy):
                 search_type="sample_context",
                 cell_type_filter=query.cell_type_cl_id,
                 max_results=max_results // 2,
-                exclude_groups={c.group_id for c in candidates},
+                exclude_keys={c.selection_key() for c in candidates},
             )
             candidates.extend(ctx_matches)
         
-        return candidates
+        return candidates[:max_results]
     
     async def _vector_search(
         self,
@@ -1168,55 +1165,75 @@ class SemanticMatchStrategy(RetrievalStrategy):
         cell_type_filter: Optional[str] = None,
         perturbation_filter: Optional[str] = None,
         max_results: int = 25,
-        exclude_groups: Optional[set[str]] = None,
-    ) -> list[CellGroupCandidate]:
+        exclude_keys: Optional[set[tuple]] = None,
+    ) -> list[CellSetCandidate]:
         """Perform vector similarity search."""
         embedding_col = f"{search_type}_embedding"
-        exclude_groups = exclude_groups or set()
+        exclude_keys = exclude_keys or set()
         
         sql = f"""
+            WITH ranked_cells AS (
+                SELECT 
+                    *,
+                    1 - ({embedding_col} <=> $1::vector) as similarity
+                FROM cells
+                WHERE {embedding_col} IS NOT NULL
+                  AND ($2::text IS NULL OR cell_type_cl_id = $2)
+                  AND ($3::text IS NULL OR perturbation_name = $3)
+                ORDER BY {embedding_col} <=> $1::vector
+                LIMIT $4
+            )
             SELECT 
-                g.group_id,
-                g.dataset,
-                g.perturbation_name,
-                g.cell_type_cl_id,
-                g.cell_type_name,
-                g.n_cells,
-                g.has_control,
-                g.control_group_id,
-                1 - (g.{embedding_col} <=> $1::vector) as similarity
-            FROM cell_groups g
-            WHERE g.{embedding_col} IS NOT NULL
-              AND ($2::text IS NULL OR g.cell_type_cl_id = $2)
-              AND ($3::text IS NULL OR g.perturbation_name = $3)
-              AND g.group_id != ALL($4)
-            ORDER BY g.{embedding_col} <=> $1::vector
+                dataset,
+                perturbation_name,
+                cell_type_cl_id,
+                cell_type_name,
+                donor_id,
+                tissue_uberon_id,
+                disease_mondo_id,
+                sample_condition,
+                sample_metadata,
+                ARRAY_AGG(cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(n_genes) AS mean_n_genes,
+                AVG(total_counts) AS mean_total_counts,
+                MAX(similarity) AS similarity
+            FROM ranked_cells
+            GROUP BY dataset, perturbation_name, cell_type_cl_id, cell_type_name,
+                     donor_id, tissue_uberon_id, disease_mondo_id, sample_condition, sample_metadata
+            ORDER BY similarity DESC
             LIMIT $5
         """
         
         rows = await self.db.execute_query(
             sql,
-            (embedding, cell_type_filter, perturbation_filter, 
-             list(exclude_groups), max_results)
+            (embedding, cell_type_filter, perturbation_filter, max_results * 5, max_results)
         )
         
-        return [
-            CellGroupCandidate(
-                group_id=row["group_id"],
+        candidates = [
+            CellSetCandidate(
                 dataset=row["dataset"],
                 perturbation_name=row["perturbation_name"],
                 cell_type_cl_id=row["cell_type_cl_id"],
                 cell_type_name=row["cell_type_name"],
+                donor_id=row["donor_id"],
+                tissue_uberon_id=row["tissue_uberon_id"],
+                disease_mondo_id=row["disease_mondo_id"],
+                sample_condition=row["sample_condition"],
+                sample_metadata=row["sample_metadata"],
+                cell_indices=row["cell_indices"],
                 n_cells=row["n_cells"],
+                mean_n_genes=row["mean_n_genes"],
+                mean_total_counts=row["mean_total_counts"],
                 strategy="semantic",
                 relevance_score=row["similarity"],
                 rationale=f"Semantic similarity ({search_type}): {row['similarity']:.3f}",
-                has_control=row["has_control"],
-                control_group_id=row["control_group_id"],
             )
             for row in rows
             if row["similarity"] >= 0.5  # Minimum threshold
         ]
+        
+        return [c for c in candidates if c.selection_key() not in exclude_keys][:max_results]
 
 
 def generate_perturbation_query_text(query: StructuredQuery) -> str:
@@ -1262,7 +1279,7 @@ import logging
 from haystack.orchestrator.services.ontology import CellOntologyService
 from haystack.orchestrator.services.database import HaystackDatabase
 from haystack.shared.models.queries import StructuredQuery
-from haystack.shared.models.cells import CellGroupCandidate
+from haystack.shared.models.cells import CellSetCandidate
 from .base import RetrievalStrategy
 
 logger = logging.getLogger(__name__)
@@ -1290,9 +1307,9 @@ class OntologyGuidedStrategy(RetrievalStrategy):
         query: StructuredQuery,
         max_results: int = 50,
         filters: Optional[dict] = None,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """
-        Find cell groups with related cell types via Cell Ontology.
+        Find cell sets with related cell types via Cell Ontology.
         
         Strategy:
         1. Get neighbors of the query cell type via CL hierarchy
@@ -1302,11 +1319,11 @@ class OntologyGuidedStrategy(RetrievalStrategy):
         
         Args:
             query: Parsed user query with resolved cell type
-            max_results: Maximum cell groups to return
+            max_results: Maximum cell sets to return
             filters: Additional SQL filters
         
         Returns:
-            List of cell group candidates with scores and rationale
+            List of cell set candidates with scores and rationale
         """
         if not query.cell_type_cl_id:
             logger.warning("No cell_type_cl_id in query, cannot use ontology-guided strategy")
@@ -1342,7 +1359,7 @@ class OntologyGuidedStrategy(RetrievalStrategy):
             ("develops_from_inverse", 2),
         ]
         
-        seen_groups = set()
+        seen_keys = set()
         
         for rel_type, base_distance in priority_order:
             if rel_type not in grouped:
@@ -1358,7 +1375,7 @@ class OntologyGuidedStrategy(RetrievalStrategy):
                     related_cl_id=neighbor["term_id"],
                     query=query,
                     max_results=max_results // len(priority_order),
-                    exclude_groups=seen_groups,
+                    exclude_keys=seen_keys,
                 )
                 
                 # Score and annotate matches
@@ -1370,7 +1387,7 @@ class OntologyGuidedStrategy(RetrievalStrategy):
                         f"({neighbor['term_id']}, distance={base_distance})"
                     )
                     match.strategy = self.strategy_name
-                    seen_groups.add(match.group_id)
+                    seen_keys.add(match.selection_key())
                 
                 candidates.extend(matches)
                 
@@ -1408,8 +1425,8 @@ class OntologyGuidedStrategy(RetrievalStrategy):
         related_cl_id: str,
         query: StructuredQuery,
         max_results: int,
-        exclude_groups: set[str],
-    ) -> list[CellGroupCandidate]:
+        exclude_keys: set[tuple],
+    ) -> list[CellSetCandidate]:
         """
         Search for cells with a related cell type.
         
@@ -1417,58 +1434,70 @@ class OntologyGuidedStrategy(RetrievalStrategy):
             related_cl_id: Cell Ontology ID of related type
             query: Original query for context (perturbation, donor, etc.)
             max_results: Maximum results to return
-            exclude_groups: Group IDs to exclude (already found)
+            exclude_keys: Selection keys to exclude (already found)
         
         Returns:
-            List of cell group candidates
+            List of cell set candidates
         """
         # Build SQL query based on task type
         if query.task_type.value.startswith("perturbation"):
             # For perturbational tasks: Find related cell type + same perturbation
             sql = """
                 SELECT 
-                    group_id,
                     dataset,
                     perturbation_name,
                     cell_type_cl_id,
                     cell_type_name,
-                    n_cells,
-                    has_control
-                FROM cell_groups
+                    donor_id,
+                    tissue_uberon_id,
+                    disease_mondo_id,
+                    sample_condition,
+                    sample_metadata,
+                    ARRAY_AGG(cell_index) AS cell_indices,
+                    COUNT(*) AS n_cells,
+                    AVG(n_genes) AS mean_n_genes,
+                    AVG(total_counts) AS mean_total_counts
+                FROM cells
                 WHERE cell_type_cl_id = $1
                   AND perturbation_name = $2
-                  AND group_id != ALL($3)
+                GROUP BY dataset, perturbation_name, cell_type_cl_id, cell_type_name,
+                         donor_id, tissue_uberon_id, disease_mondo_id, sample_condition, sample_metadata
                 ORDER BY n_cells DESC
-                LIMIT $4
+                LIMIT $3
             """
             params = (
                 related_cl_id,
                 query.perturbation_resolved,
-                list(exclude_groups),
                 max_results,
             )
         else:
             # For observational tasks: Find related cell type + donor context
             sql = """
                 SELECT 
-                    group_id,
                     dataset,
                     perturbation_name,
                     cell_type_cl_id,
                     cell_type_name,
                     donor_id,
-                    n_cells
-                FROM cell_groups
+                    tissue_uberon_id,
+                    disease_mondo_id,
+                    sample_condition,
+                    sample_metadata,
+                    ARRAY_AGG(cell_index) AS cell_indices,
+                    COUNT(*) AS n_cells,
+                    AVG(n_genes) AS mean_n_genes,
+                    AVG(total_counts) AS mean_total_counts
+                FROM cells
                 WHERE cell_type_cl_id = $1
                   AND ($2::text IS NULL OR donor_id = $2)
-                  AND group_id != ALL($3)
+                GROUP BY dataset, perturbation_name, cell_type_cl_id, cell_type_name,
+                         donor_id, tissue_uberon_id, disease_mondo_id, sample_condition, sample_metadata
                 ORDER BY n_cells DESC
-                LIMIT $4
+                LIMIT $3
             """
             params = (
                 related_cl_id,
                 query.target_donor_id,
-                list(exclude_groups),
                 max_results,
             )
         
@@ -1476,20 +1505,25 @@ class OntologyGuidedStrategy(RetrievalStrategy):
         
         candidates = []
         for row in rows:
-            candidates.append(CellGroupCandidate(
-                group_id=row["group_id"],
+            candidates.append(CellSetCandidate(
                 dataset=row["dataset"],
+                perturbation_name=row.get("perturbation_name"),
                 cell_type_cl_id=row["cell_type_cl_id"],
                 cell_type_name=row["cell_type_name"],
-                perturbation_name=row.get("perturbation_name"),
                 donor_id=row.get("donor_id"),
+                tissue_uberon_id=row.get("tissue_uberon_id"),
+                disease_mondo_id=row.get("disease_mondo_id"),
+                sample_condition=row.get("sample_condition"),
+                sample_metadata=row.get("sample_metadata"),
+                cell_indices=row["cell_indices"],
                 n_cells=row["n_cells"],
-                has_control=row.get("has_control", False),
+                mean_n_genes=row["mean_n_genes"],
+                mean_total_counts=row["mean_total_counts"],
                 relevance_score=0.0,  # Will be set by caller
                 strategy=self.strategy_name,
             ))
         
-        return candidates
+        return [c for c in candidates if c.selection_key() not in exclude_keys][:max_results]
 ```
 
 ### 8.3 Multi-Hop Traversal (Advanced)
@@ -1502,7 +1536,7 @@ async def retrieve_with_multi_hop(
     query: StructuredQuery,
     max_results: int = 50,
     max_hops: int = 2,
-) -> list[CellGroupCandidate]:
+) -> list[CellSetCandidate]:
     """
     Find cells via multi-hop ontology traversal.
     
@@ -1511,11 +1545,11 @@ async def retrieve_with_multi_hop(
     
     Args:
         query: Parsed user query
-        max_results: Maximum cell groups to return
+        max_results: Maximum cell sets to return
         max_hops: Maximum graph distance to traverse
     
     Returns:
-        List of cell group candidates with distance-weighted scores
+        List of cell set candidates with distance-weighted scores
     """
     candidates = []
     visited_terms = {query.cell_type_cl_id}
@@ -1554,7 +1588,7 @@ async def retrieve_with_multi_hop(
                     related_cl_id=neighbor_id,
                     query=query,
                     max_results=max_results // (hop * 2),
-                    exclude_groups={c.group_id for c in candidates},
+                    exclude_keys={c.selection_key() for c in candidates},
                 )
                 
                 # Score by hop distance
@@ -1590,7 +1624,7 @@ Cell type embeddings include ontology lineage to improve semantic matching. See 
 
 ### 9.1 Purpose
 
-The Donor Context strategy selects reference cell groups from donors with similar clinical context to the target donor for observational ICL tasks. It prioritizes matching tissue, disease state, and donor demographics before falling back to embedding similarity.
+The Donor Context strategy selects reference cell sets from donors with similar clinical context to the target donor for observational ICL tasks. It prioritizes matching tissue, disease state, and donor demographics before falling back to embedding similarity.
 
 ### 9.2 Retrieval Logic
 
@@ -1607,28 +1641,45 @@ class DonorContextStrategy(RetrievalStrategy):
         query: StructuredQuery,
         max_results: int = 50,
         filters: Optional[dict] = None,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         context_text = self._build_context_text(query)
         embedding = await self.embedder.embed(context_text)
         
         sql = """
+            WITH similar_donors AS (
+                SELECT 
+                    donor_id,
+                    1 - (clinical_embedding <=> $1::vector) as donor_similarity
+                FROM donors
+                WHERE donor_id != $3
+                ORDER BY clinical_embedding <=> $1::vector
+                LIMIT 100
+            )
             SELECT 
-                g.group_id,
-                g.dataset,
-                g.cell_type_name,
-                g.cell_type_cl_id,
-                g.donor_id,
-                g.tissue_name,
-                g.disease_name,
-                g.n_cells,
-                1 - (d.clinical_embedding <=> $1::vector) as donor_similarity
-            FROM cell_groups g
-            JOIN donors d ON g.donor_id = d.donor_id
-            WHERE g.cell_type_cl_id = $2
-              AND g.donor_id != $3
-              AND ($4::text IS NULL OR g.tissue_uberon_id = $4)
-              AND ($5::text IS NULL OR g.disease_mondo_id = $5)
-            ORDER BY d.clinical_embedding <=> $1::vector
+                c.dataset,
+                c.cell_type_name,
+                c.cell_type_cl_id,
+                c.donor_id,
+                c.tissue_name,
+                c.disease_name,
+                c.tissue_uberon_id,
+                c.disease_mondo_id,
+                c.sample_condition,
+                c.sample_metadata,
+                ARRAY_AGG(c.cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(c.n_genes) AS mean_n_genes,
+                AVG(c.total_counts) AS mean_total_counts,
+                MAX(sd.donor_similarity) as donor_similarity
+            FROM cells c
+            JOIN similar_donors sd ON c.donor_id = sd.donor_id
+            WHERE c.cell_type_cl_id = $2
+              AND ($4::text IS NULL OR c.tissue_uberon_id = $4)
+              AND ($5::text IS NULL OR c.disease_mondo_id = $5)
+            GROUP BY c.dataset, c.cell_type_name, c.cell_type_cl_id, c.donor_id,
+                     c.tissue_name, c.disease_name, c.tissue_uberon_id,
+                     c.disease_mondo_id, c.sample_condition, c.sample_metadata
+            ORDER BY donor_similarity DESC, n_cells DESC
             LIMIT $6
         """
         ...
@@ -1655,27 +1706,32 @@ class TissueAtlasStrategy(RetrievalStrategy):
         query: StructuredQuery,
         max_results: int = 50,
         filters: Optional[dict] = None,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         sql = """
             SELECT 
-                g.group_id,
-                g.dataset,
-                g.cell_type_name,
-                g.cell_type_cl_id,
-                g.donor_id,
-                g.tissue_name,
-                g.n_cells,
-                g.mean_n_genes
-            FROM cell_groups g
-            WHERE g.cell_type_cl_id = $1
-              AND g.is_reference_sample = TRUE
-              AND ($2::text IS NULL OR g.tissue_uberon_id = $2)
+                c.dataset,
+                c.cell_type_name,
+                c.cell_type_cl_id,
+                c.donor_id,
+                c.tissue_name,
+                c.tissue_uberon_id,
+                c.sample_condition,
+                c.sample_metadata,
+                ARRAY_AGG(c.cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(c.n_genes) AS mean_n_genes
+            FROM cells c
+            WHERE c.cell_type_cl_id = $1
+              AND c.is_control = TRUE
+              AND ($2::text IS NULL OR c.tissue_uberon_id = $2)
+            GROUP BY c.dataset, c.cell_type_name, c.cell_type_cl_id, c.donor_id,
+                     c.tissue_name, c.tissue_uberon_id, c.sample_condition, c.sample_metadata
             ORDER BY 
-                CASE g.dataset 
+                CASE c.dataset 
                     WHEN 'tabula_sapiens' THEN 1 
                     ELSE 2 
                 END,
-                g.n_cells DESC
+                n_cells DESC
             LIMIT $3
         """
         ...
@@ -1709,9 +1765,9 @@ class CandidateRanker:
     
     def rank_candidates(
         self,
-        candidates: list[CellGroupCandidate],
+        candidates: list[CellSetCandidate],
         top_k: int = 10,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """
         Rank candidates and select top K.
         
@@ -1752,7 +1808,7 @@ class CandidateRanker:
     
     def _compute_quality_score(
         self,
-        candidate: CellGroupCandidate,
+        candidate: CellSetCandidate,
         max_cells: int,
     ) -> float:
         """Compute quality score for a candidate."""
@@ -1766,8 +1822,8 @@ class CandidateRanker:
     
     def _compute_final_score(
         self,
-        candidate: CellGroupCandidate,
-        selected: list[CellGroupCandidate],
+        candidate: CellSetCandidate,
+        selected: list[CellSetCandidate],
     ) -> float:
         """Compute final score including diversity."""
         # Relevance
@@ -1787,8 +1843,8 @@ class CandidateRanker:
     
     def _compute_diversity(
         self,
-        candidate: CellGroupCandidate,
-        selected: list[CellGroupCandidate],
+        candidate: CellSetCandidate,
+        selected: list[CellSetCandidate],
     ) -> float:
         """Compute diversity contribution."""
         if not selected:
@@ -1883,19 +1939,14 @@ async def build_haystack_index(
         all_metadata = parse_metadata + op_metadata + ts_metadata
         print(f"  Total cells: {len(all_metadata):,}")
         
-        # Step 2: Build cell groups
-        print("Step 2: Building cell groups...")
-        cell_groups = build_cell_groups(all_metadata)
-        print(f"  Total groups: {len(cell_groups):,}")
-        
-        # Step 3: Generate text descriptions
-        print("Step 3: Generating text descriptions...")
+        # Step 2: Generate text descriptions
+        print("Step 2: Generating text descriptions...")
         perturbation_texts = [generate_perturbation_text(m) for m in all_metadata]
         cell_type_texts = [await generate_cell_type_text(m) for m in all_metadata]
         sample_context_texts = [generate_sample_context_text(m) for m in all_metadata]
         
-        # Step 4: Compute text embeddings (batched)
-        print("Step 4: Computing text embeddings...")
+        # Step 3: Compute text embeddings (batched)
+        print("Step 3: Computing text embeddings...")
         perturbation_embeddings = await batch_embed_texts(
             embedding_client, perturbation_texts, batch_size
         )
@@ -1906,8 +1957,8 @@ async def build_haystack_index(
             embedding_client, sample_context_texts, batch_size
         )
         
-        # Step 5: Load into PostgreSQL
-        print("Step 5: Loading into PostgreSQL...")
+        # Step 4: Load into PostgreSQL
+        print("Step 4: Loading into PostgreSQL...")
         await load_cells_to_postgres(
             db,
             metadata=all_metadata,
@@ -1916,22 +1967,12 @@ async def build_haystack_index(
             sample_context_embeddings=sample_context_embeddings,
         )
         
-        # Step 6: Load cell groups
-        print("Step 6: Loading cell groups...")
-        await load_groups_to_postgres(
-            db,
-            cell_groups,
-            perturbation_embeddings,
-            cell_type_embeddings,
-            sample_context_embeddings,
-        )
-        
-        # Step 7: Build HNSW indexes
-        print("Step 7: Building HNSW indexes...")
+        # Step 5: Build HNSW indexes
+        print("Step 5: Building HNSW indexes...")
         await build_hnsw_indexes(db)
         
-        # Step 8: Build auxiliary tables
-        print("Step 8: Building auxiliary tables...")
+        # Step 6: Build auxiliary tables
+        print("Step 6: Building auxiliary tables...")
         await build_perturbation_lookup_table(all_metadata, db)
         await build_cell_type_lookup_table(all_metadata, db)
         await build_synonym_table(db)
@@ -1985,7 +2026,6 @@ async def load_cells_to_postgres(
                 (
                     m.cell_index,
                     m.dataset,
-                    f"{m.dataset}_{m.perturbation_name}_{m.cell_type_cl_id}_{m.donor_id}",
                     m.cell_type_original,
                     m.cell_type_cl_id,
                     m.cell_type_name,
@@ -2018,7 +2058,7 @@ async def load_cells_to_postgres(
             await conn.executemany(
                 """
                 INSERT INTO cells (
-                    cell_index, dataset, group_id,
+                    cell_index, dataset,
                     cell_type_original, cell_type_cl_id, cell_type_name,
                     perturbation_original, perturbation_name, perturbation_type, is_control,
                     tissue_original, tissue_uberon_id, tissue_name, donor_id,
@@ -2026,7 +2066,7 @@ async def load_cells_to_postgres(
                     perturbation_external_ids, perturbation_targets, perturbation_pathways,
                     n_genes, total_counts,
                     perturbation_embedding, cell_type_embedding, sample_context_embedding
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
                 """,
                 values,
             )
@@ -2042,9 +2082,6 @@ async def build_hnsw_indexes(db: HaystackDatabase):
         await conn.execute("DROP INDEX IF EXISTS idx_cells_perturbation_embedding")
         await conn.execute("DROP INDEX IF EXISTS idx_cells_cell_type_embedding")
         await conn.execute("DROP INDEX IF EXISTS idx_cells_sample_context_embedding")
-        await conn.execute("DROP INDEX IF EXISTS idx_groups_perturbation_embedding")
-        await conn.execute("DROP INDEX IF EXISTS idx_groups_cell_type_embedding")
-        await conn.execute("DROP INDEX IF EXISTS idx_groups_sample_context_embedding")
         
         # Build new indexes
         print("  Building perturbation embedding index on cells...")
@@ -2068,26 +2105,6 @@ async def build_hnsw_indexes(db: HaystackDatabase):
             WITH (m = 16, ef_construction = 64)
         """)
         
-        print("  Building perturbation embedding index on groups...")
-        await conn.execute("""
-            CREATE INDEX idx_groups_perturbation_embedding ON cell_groups
-            USING hnsw (perturbation_embedding vector_cosine_ops)
-            WITH (m = 16, ef_construction = 64)
-        """)
-        
-        print("  Building cell type embedding index on groups...")
-        await conn.execute("""
-            CREATE INDEX idx_groups_cell_type_embedding ON cell_groups
-            USING hnsw (cell_type_embedding vector_cosine_ops)
-            WITH (m = 16, ef_construction = 64)
-        """)
-        
-        print("  Building sample context embedding index on groups...")
-        await conn.execute("""
-            CREATE INDEX idx_groups_sample_context_embedding ON cell_groups
-            USING hnsw (sample_context_embedding vector_cosine_ops)
-            WITH (m = 16, ef_construction = 64)
-        """)
 ```
 
 ---
@@ -2310,18 +2327,29 @@ class HaystackDatabase:
         
         # Build query
         sql = f"""
+            WITH ranked_cells AS (
+                SELECT 
+                    *,
+                    1 - ({embedding_col} <=> $1::vector) as similarity
+                FROM cells
+                WHERE {embedding_col} IS NOT NULL
+            )
             SELECT 
-                group_id,
                 dataset,
                 perturbation_name,
                 cell_type_cl_id,
                 cell_type_name,
-                n_cells,
-                has_control,
-                control_group_id,
-                1 - ({embedding_col} <=> $1::vector) as similarity
-            FROM cell_groups
-            WHERE {embedding_col} IS NOT NULL
+                donor_id,
+                tissue_uberon_id,
+                disease_mondo_id,
+                sample_condition,
+                sample_metadata,
+                ARRAY_AGG(cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(n_genes) AS mean_n_genes,
+                AVG(total_counts) AS mean_total_counts,
+                MAX(similarity) as similarity
+            FROM ranked_cells
         """
         
         params = [query_embedding]
@@ -2335,7 +2363,9 @@ class HaystackDatabase:
                     param_idx += 1
         
         sql += f"""
-            ORDER BY {embedding_col} <=> $1::vector
+            GROUP BY dataset, perturbation_name, cell_type_cl_id, cell_type_name,
+                     donor_id, tissue_uberon_id, disease_mondo_id, sample_condition, sample_metadata
+            ORDER BY similarity DESC
             LIMIT {top_k}
         """
         
@@ -2343,25 +2373,49 @@ class HaystackDatabase:
             rows = await conn.fetch(sql, *params, timeout=30)
             return [dict(row) for row in rows]
     
-    async def get_cell_group(self, group_id: str) -> Optional[dict]:
-        """Get a single cell group by ID."""
+    async def get_cell_set(
+        self,
+        selection: dict,
+    ) -> Optional[dict]:
+        """Get a single aggregated cell set by selection criteria."""
         sql = """
-            SELECT *
-            FROM cell_groups
-            WHERE group_id = $1
+            SELECT 
+                dataset,
+                perturbation_name,
+                cell_type_cl_id,
+                cell_type_name,
+                donor_id,
+                tissue_uberon_id,
+                disease_mondo_id,
+                sample_condition,
+                sample_metadata,
+                ARRAY_AGG(cell_index) AS cell_indices,
+                COUNT(*) AS n_cells,
+                AVG(n_genes) AS mean_n_genes,
+                AVG(total_counts) AS mean_total_counts
+            FROM cells
+            WHERE dataset = $1
+              AND ($2::text IS NULL OR perturbation_name = $2)
+              AND ($3::text IS NULL OR cell_type_cl_id = $3)
+              AND ($4::text IS NULL OR donor_id = $4)
+              AND ($5::text IS NULL OR tissue_uberon_id = $5)
+              AND ($6::text IS NULL OR disease_mondo_id = $6)
+              AND ($7::text IS NULL OR sample_condition = $7)
+            GROUP BY dataset, perturbation_name, cell_type_cl_id, cell_type_name,
+                     donor_id, tissue_uberon_id, disease_mondo_id, sample_condition, sample_metadata
+            LIMIT 1
         """
-        rows = await self.execute_query(sql, (group_id,))
+        params = (
+            selection["dataset"],
+            selection.get("perturbation_name"),
+            selection.get("cell_type_cl_id"),
+            selection.get("donor_id"),
+            selection.get("tissue_uberon_id"),
+            selection.get("disease_mondo_id"),
+            selection.get("sample_condition"),
+        )
+        rows = await self.execute_query(sql, params)
         return rows[0] if rows else None
-    
-    async def get_cell_indices(self, group_id: str) -> list[int]:
-        """Get cell indices for a group."""
-        sql = """
-            SELECT cell_indices
-            FROM cell_groups
-            WHERE group_id = $1
-        """
-        rows = await self.execute_query(sql, (group_id,))
-        return rows[0]["cell_indices"] if rows else []
     
     async def list_perturbations(
         self,

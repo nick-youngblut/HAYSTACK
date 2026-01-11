@@ -23,7 +23,6 @@ CREATE TABLE cells (
     
     -- Identifiers
     cell_index INT NOT NULL,
-    group_id VARCHAR(64) NOT NULL,
     dataset VARCHAR(32) NOT NULL,
     
     -- Cell type (harmonized)
@@ -62,38 +61,6 @@ CREATE TABLE cells (
     sample_context_embedding vector(1536),
     
     -- Timestamps
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Cell groups table (aggregated view)
-CREATE TABLE cell_groups (
-    group_id VARCHAR(64) PRIMARY KEY,
-    dataset VARCHAR(32) NOT NULL,
-    perturbation_name VARCHAR(256),
-    cell_type_cl_id VARCHAR(32),
-    donor_id VARCHAR(64),
-    tissue_uberon_id VARCHAR(32),
-    tissue_name VARCHAR(256),
-    disease_mondo_id VARCHAR(32),
-    disease_name VARCHAR(256),
-    sample_condition VARCHAR(256),
-    sample_metadata JSONB DEFAULT '{}',
-    is_reference_sample BOOLEAN DEFAULT FALSE,
-    
-    n_cells INT NOT NULL,
-    cell_indices INT[] NOT NULL,
-    
-    mean_n_genes FLOAT,
-    mean_total_counts FLOAT,
-    
-    has_control BOOLEAN DEFAULT FALSE,
-    control_group_id VARCHAR(64),
-    
-    -- Representative embeddings (mean of cells in group)
-    perturbation_embedding vector(1536),
-    cell_type_embedding vector(1536),
-    sample_context_embedding vector(1536),
-    
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -252,10 +219,12 @@ CREATE INDEX idx_cells_cell_type ON cells(cell_type_cl_id);
 CREATE INDEX idx_cells_perturbation ON cells(perturbation_name);
 CREATE INDEX idx_cells_tissue ON cells(tissue_uberon_id);
 CREATE INDEX idx_cells_is_control ON cells(is_control);
-CREATE INDEX idx_cells_group ON cells(group_id);
 CREATE INDEX idx_cells_donor ON cells(donor_id);
 CREATE INDEX idx_cells_disease ON cells(disease_mondo_id);
 CREATE INDEX idx_cells_condition ON cells(sample_condition);
+CREATE INDEX idx_cells_pert_ct_donor ON cells(perturbation_name, cell_type_cl_id, donor_id);
+CREATE INDEX idx_cells_tissue_ct ON cells(tissue_uberon_id, cell_type_cl_id);
+CREATE INDEX idx_cells_donor_ct ON cells(donor_id, cell_type_cl_id);
 
 CREATE INDEX idx_cell_types_lineage ON cell_types USING GIN(lineage_cl_ids);
 
@@ -367,7 +336,7 @@ async def populate_lineage():
 CREATE ROLE haystack_app WITH LOGIN PASSWORD 'secure_password';
 GRANT CONNECT ON DATABASE haystack TO haystack_app;
 GRANT USAGE ON SCHEMA public TO haystack_app;
-GRANT SELECT ON cells, cell_groups, donors, conditions, perturbations, cell_types, synonyms TO haystack_app;
+GRANT SELECT ON cells, donors, conditions, perturbations, cell_types, synonyms TO haystack_app;
 GRANT SELECT ON ontology_terms, ontology_relationships TO haystack_app;
 GRANT SELECT, INSERT, UPDATE ON runs TO haystack_app;
 GRANT USAGE, SELECT ON SEQUENCE runs_run_id_seq TO haystack_app;
@@ -488,7 +457,7 @@ class HaystackDatabase:
         
         sql = f"""
             SELECT 
-                group_id,
+                cell_index,
                 perturbation_name,
                 cell_type_cl_id,
                 cell_type_name,

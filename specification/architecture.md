@@ -23,7 +23,7 @@ This design ensures runs survive browser disconnects, Cloud Run scale-downs, and
 │  │   GET  /api/v1/runs/{id}    → Read status from Cloud SQL                 │   │
 │  │   POST /api/v1/runs/{id}/cancel → Cancel Batch job via API               │   │
 │  │   GET  /api/v1/runs/{id}/result → Return signed GCS URLs                 │   │
-│  │   GET  /api/v1/cells/*      → Cell metadata browsing                     │   │
+│  │   (no /api/v1/cells browse) → Cell retrieval happens inside orchestrator │   │
 │  │   GET  /api/v1/metadata/*   → Lookup tables                              │   │
 │  │   /*                        → Static files (Next.js)                     │   │
 │  └──────────────────────────────────────────────────────────────────────────┘   │

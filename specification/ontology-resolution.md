@@ -1205,9 +1205,9 @@ class OntologyGuidedStrategy(RetrievalStrategy):
         query: StructuredQuery,
         max_results: int = 50,
         filters: Optional[dict] = None,
-    ) -> list[CellGroupCandidate]:
+    ) -> list[CellSetCandidate]:
         """
-        Find cell groups with related cell types via Cell Ontology.
+        Find cell sets with related cell types via Cell Ontology.
         
         Strategy:
         1. Use get_cell_type_neighbors to find parent/child/sibling types
@@ -1241,7 +1241,7 @@ class OntologyGuidedStrategy(RetrievalStrategy):
                     cell_type_cl_id=neighbor["term_id"],
                     perturbation_name=query.perturbation_resolved,
                     max_results=max_results // len(neighbor_group) if neighbor_group else max_results,
-                    exclude_groups={c.group_id for c in candidates},
+                    exclude_keys={c.selection_key() for c in candidates},
                 )
                 
                 for match in matches:

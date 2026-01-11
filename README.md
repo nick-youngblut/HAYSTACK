@@ -411,7 +411,6 @@ When the backend is running, interactive API documentation is available at:
 | `GET` | `/api/v1/runs/{run_id}/result` | Get completed run results |
 | `GET` | `/api/v1/runs/` | List user's runs |
 | `POST` | `/api/v1/runs/{run_id}/cancel` | Cancel a running job |
-| `GET` | `/api/v1/cells/groups` | Browse cell groups |
 | `GET` | `/api/v1/metadata/perturbations` | List available perturbations |
 | `GET` | `/api/v1/metadata/cell-types` | List available cell types |
 
@@ -478,4 +477,3 @@ gcloud run deploy haystack-prod \
   --set-env-vars "ENV_FOR_DYNACONF=production" \
   --set-secrets "ANTHROPIC_API_KEY=anthropic-api-key:latest"
 ```
-

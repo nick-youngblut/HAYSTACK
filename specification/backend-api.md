@@ -16,13 +16,11 @@ haystack/
 │   ├── routes/
 │   │   ├── __init__.py
 │   │   ├── runs.py             # /api/v1/runs endpoints
-│   │   ├── cells.py            # /api/v1/cells endpoints
 │   │   ├── metadata.py         # /api/v1/metadata endpoints
 │   │   └── health.py           # Health check
 │   ├── models/
 │   │   ├── __init__.py
-│   │   ├── runs.py             # Run-related Pydantic models
-│   │   └── cells.py            # Cell-related models
+│   │   └── runs.py             # Run-related Pydantic models
 │   ├── services/
 │   │   ├── __init__.py
 │   │   ├── database.py         # Cloud SQL client (read status)
@@ -91,7 +89,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from api.config import settings
-from api.routes import runs, cells, metadata, health
+from api.routes import runs, metadata, health
 from api.services.database import database
 from api.services.gcs import gcs_service
 
@@ -138,7 +136,6 @@ def create_app() -> FastAPI:
     # API routes
     app.include_router(health.router, prefix="/api", tags=["health"])
     app.include_router(runs.router, prefix="/api/v1/runs", tags=["runs"])
-    app.include_router(cells.router, prefix="/api/v1/cells", tags=["cells"])
     app.include_router(metadata.router, prefix="/api/v1/metadata", tags=["metadata"])
     
     # Serve static frontend (production)
@@ -155,6 +152,7 @@ app = create_app()
 ### 9.3 API Endpoints (Cloud Run)
 
 The Cloud Run API is intentionally thin — it submits Batch jobs and queries status from Cloud SQL.
+It does not expose endpoints for browsing cell sets; those are computed dynamically inside the orchestrator.
 
 ```python
 # api/routes/runs.py
