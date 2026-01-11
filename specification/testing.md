@@ -107,6 +107,61 @@ describe("RunForm", () => {
 });
 ```
 
+### 15.3 Agent + Tool Tests
+
+Test tools as pure functions with mocked runtime/context, then add agent-level integration tests that exercise tool selection and orchestration. Separate fast unit tests from optional LLM-backed integration tests.
+
+```python
+# backend/tests/agents/tools/test_query_tool.py
+
+import pytest
+from backend.agents.tools.query_tool import query_tool
+
+
+class MockRuntime:
+    """Minimal ToolRuntime stand-in for unit tests."""
+
+    def __init__(self, config=None):
+        self.config = config or {}
+
+
+def test_query_tool_returns_ranked_items(mocker):
+    runtime = MockRuntime(config={"collections": {"papers": "test_papers"}})
+    mocker.patch("backend.agents.tools.query_tool.search_index", return_value=[
+        {"id": "p1", "score": 0.91},
+        {"id": "p2", "score": 0.84},
+    ])
+
+    result = query_tool("tgf-beta fibroblasts", runtime=runtime)
+
+    assert result["items"][0]["id"] == "p1"
+    assert result["items"][0]["score"] >= result["items"][1]["score"]
+```
+
+```python
+# backend/tests/agents/test_agent_integration.py
+
+import pytest
+from langchain.chat_models import init_chat_model
+from backend.agents.main import build_agent
+
+
+@pytest.mark.asyncio
+async def test_agent_routes_to_tool(mocker):
+    # Mock tool execution to make the agent deterministic
+    mocker.patch("backend.agents.tools.query_tool.query_tool", return_value={
+        "items": [{"id": "p1", "score": 0.91}],
+    })
+    model = init_chat_model("openai:gpt-5-mini", temperature=0)
+    agent = build_agent(model=model)
+
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": "Find TGF-beta fibroblast papers"}]})
+
+    assert "p1" in str(result)
+```
+
+Optional integration tests should be marked (e.g., `@pytest.mark.integration`) and run with real model keys for end-to-end validation.
+
 ---
 
 ## Related Specs
@@ -114,3 +169,5 @@ describe("RunForm", () => {
 - `specification/backend-api.md`
 - `specification/orchestrator.md`
 - `specification/frontend.md`
+- `specification/agents.md`
+- `specification/tools.md`
