@@ -1787,3 +1787,9 @@ literature = [
 
 - **docling**: For PDF-to-markdown conversion (local processing)
 - **OpenAI API**: Optional, for image descriptions in PDFs
+
+## Related Specs
+
+- `specification/agents.md`
+- `specification/tools.md`
+- `specification/data-models.md`

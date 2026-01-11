@@ -2268,3 +2268,9 @@ class HaystackDatabase:
 3. **Read Replicas**: Cloud SQL read replicas for scaling concurrent agent queries
 4. **Approximate Counts**: HyperLogLog for fast cardinality estimates in large GROUP BY queries
 5. **Index Tuning**: Tune HNSW parameters (m, ef_construction, ef_search) based on recall/latency benchmarks
+
+## Related Specs
+
+- `specification/agents.md`
+- `specification/data-models.md`
+- `specification/database.md`
