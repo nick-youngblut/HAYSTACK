@@ -1333,10 +1333,16 @@ The Query Understanding subagent uses literature search to gather biological con
 # In orchestrator/agents/query_understanding.py
 
 QUERY_UNDERSTANDING_TOOLS = [
-    resolve_cell_type_tool,
+    # Cell Ontology tools (primary for cell type resolution)
+    resolve_cell_type_semantic,
+    get_cell_type_neighbors,
+    query_cell_ontology_ols,
+
+    # Other entity resolution tools
     resolve_perturbation_tool,
     resolve_tissue_tool,
     resolve_disease_tool,
+
     get_drug_targets_tool,
     get_pathway_priors_tool,
     # Literature tools

@@ -4,21 +4,6 @@
 
 All tools use the LangChain `@tool` decorator and should be designed to run both in unit tests and inside agents. Prefer async tools for I/O. If a tool needs access to runtime context (config, state, streaming), include a `runtime` parameter and treat it as optional to keep tests simple.
 
-```python
-from langchain_core.tools import tool
-from langchain.tools import ToolRuntime
-
-@tool
-async def resolve_cell_type(
-    query: str,
-    runtime: ToolRuntime | None = None,
-) -> dict:
-    """Resolve a cell type name to CL ID with provenance."""
-    config = (runtime.config or {}) if runtime else {}
-    # Use config for thresholds, collection names, etc.
-    return {"label": "fibroblast", "cl_id": "CL:0000057"}
-```
-
 For tools that stream progress to the UI, emit structured progress events via `runtime.stream_writer` (if present). Failures should raise typed exceptions (see `specification/error-handling.md`) and include enough context to support retries.
 
 ### 6.1 Database Query Tools
@@ -132,7 +117,242 @@ async def find_tissue_atlas_cells(
     ...
 ```
 
-### 6.2 Drug-Target Knowledge Tools
+### 6.2 Cell Ontology Resolution Tools
+
+These tools enable agents to resolve free-text cell type labels to Cell Ontology (CL) IDs and navigate the CL hierarchy. They replace the previous `resolve_cell_type_tool` stub.
+
+```python
+from langchain_core.tools import tool
+from typing import Optional
+import yaml
+
+
+@tool
+async def resolve_cell_type_semantic(
+    cell_labels: str,
+    k: int = 3,
+    distance_threshold: float = 0.7,
+) -> str:
+    """
+    Map free-text cell type labels to Cell Ontology terms using semantic search.
+    
+    Uses OpenAI embeddings (text-embedding-3-small) to find semantically similar
+    CL terms. Input labels are automatically deduplicated.
+    
+    Args:
+        cell_labels: Semicolon-separated list of free-text cell type labels.
+                     Example: "fibroblast; activated T cell; lung epithelial"
+        k: Number of nearest neighbors to return per label (1-10, default 3)
+        distance_threshold: Maximum cosine distance for matches (0-1, default 0.7).
+                           Lower values = stricter matching.
+    
+    Returns:
+        YAML-formatted results mapping each label to matched CL terms.
+        
+        Example output:
+        ```yaml
+        fibroblast:
+          - term_id: CL:0000057
+            name: fibroblast
+            definition: A connective tissue cell which secretes...
+            distance: 0.05
+          - term_id: CL:0000058
+            name: chondroblast
+            definition: A cell that secretes cartilage matrix...
+            distance: 0.32
+        activated T cell:
+          - term_id: CL:0000911
+            name: activated T cell
+            definition: A T cell that has been activated...
+            distance: 0.08
+        unknown cell type: No ontology ID found
+        ```
+    
+    Notes:
+        - Distance scores range from 0 (identical) to 1 (orthogonal)
+        - Labels with no matches above threshold return "No ontology ID found"
+        - Use this tool to resolve cell types mentioned in user queries
+        - For hierarchical relationships, use get_cell_type_neighbors
+    """
+    from haystack.orchestrator.services.ontology import CellOntologyService
+    
+    # Parse semicolon-separated labels
+    labels = [label.strip() for label in cell_labels.split(";") if label.strip()]
+    
+    if not labels:
+        return "Error: No valid cell labels provided"
+    
+    # Deduplicate while preserving order
+    seen = set()
+    unique_labels = []
+    for label in labels:
+        if label.lower() not in seen:
+            seen.add(label.lower())
+            unique_labels.append(label)
+    
+    # Perform semantic search
+    service = CellOntologyService.get_instance()
+    results = await service.semantic_search(
+        labels=unique_labels,
+        k=k,
+        distance_threshold=distance_threshold,
+    )
+    
+    # Format as YAML
+    return yaml.dump(results, sort_keys=False, indent=2, allow_unicode=True)
+
+
+@tool
+async def get_cell_type_neighbors(
+    term_ids: str,
+) -> str:
+    """
+    Get related Cell Ontology terms through ontology relationships.
+    
+    Retrieves all neighbor terms connected to the specified CL IDs via
+    ontology relationships (is_a, part_of, develops_from, etc.).
+    
+    Args:
+        term_ids: Semicolon-separated list of Cell Ontology term IDs.
+                  Example: "CL:0000057; CL:0000236"
+    
+    Returns:
+        YAML-formatted results mapping each term ID to its neighbors.
+        
+        Example output:
+        ```yaml
+        CL:0000057:
+          - term_id: CL:0000548
+            name: animal cell
+            definition: A cell of the body of an animal...
+            relationship_type: is_a
+          - term_id: CL:0002553
+            name: fibroblast of lung
+            definition: A fibroblast that is part of lung...
+            relationship_type: is_a_inverse
+        CL:0000236:
+          - term_id: CL:0000945
+            name: lymphocyte
+            definition: A leukocyte of the lymphoid lineage...
+            relationship_type: is_a
+        CL:9999999: Error: Invalid term ID format. Expected CL:XXXXXXX
+        ```
+    
+    Relationship types:
+        - is_a: Term is a subtype of neighbor (child → parent)
+        - is_a_inverse: Neighbor is a subtype of term (parent → child)
+        - part_of: Term is part of neighbor
+        - part_of_inverse: Neighbor is part of term
+        - develops_from: Term develops from neighbor
+        - develops_from_inverse: Neighbor develops from term
+    
+    Notes:
+        - Use this tool when exact cell type match isn't available
+        - Navigate hierarchy to find broader (parent) or narrower (child) types
+        - Invalid term IDs return an error message
+        - Terms with no relationships return an empty list
+    """
+    from haystack.orchestrator.services.ontology import CellOntologyService
+    import yaml
+    
+    # Parse semicolon-separated term IDs
+    ids = [tid.strip() for tid in term_ids.split(";") if tid.strip()]
+    
+    if not ids:
+        return "Error: No valid term IDs provided"
+    
+    # Validate and deduplicate
+    valid_ids = []
+    invalid_ids = []
+    seen = set()
+    
+    for tid in ids:
+        if tid in seen:
+            continue
+        seen.add(tid)
+        
+        # Validate CL ID format
+        if tid.startswith("CL:") and len(tid) == 10:
+            valid_ids.append(tid)
+        else:
+            invalid_ids.append(tid)
+    
+    # Get neighbors
+    service = CellOntologyService.get_instance()
+    results = await service.get_neighbors(term_ids=valid_ids)
+    
+    # Add invalid IDs to results
+    for tid in invalid_ids:
+        results[tid] = f"Error: Invalid term ID format. Expected CL:XXXXXXX"
+    
+    # Format as YAML
+    return yaml.dump(results, sort_keys=False, indent=2, allow_unicode=True)
+
+
+@tool
+async def query_cell_ontology_ols(
+    search_terms: str,
+) -> str:
+    """
+    Query the Ontology Lookup Service (OLS) for Cell Ontology terms.
+    
+    Uses keyword search against the EBI OLS API as a fallback when 
+    semantic search doesn't find matches. Useful for very specific or
+    newly added ontology terms.
+    
+    Args:
+        search_terms: Semicolon-separated list of search terms.
+                      Example: "fibroblast; B lymphocyte; stem cell"
+    
+    Returns:
+        YAML-formatted results mapping each search term to matched CL terms.
+        
+        Example output:
+        ```yaml
+        fibroblast:
+          - term_id: CL:0000057
+            name: fibroblast
+            definition: A connective tissue cell which secretes...
+        B lymphocyte:
+          - term_id: CL:0000236
+            name: B cell
+            definition: A lymphocyte of B lineage...
+        unknown term: []
+        ```
+    
+    Notes:
+        - Only returns Cell Ontology (CL:) terms
+        - Results are filtered by exact ontology prefix
+        - Use this as a fallback when semantic search returns no matches
+        - Rate limited to avoid overwhelming the OLS API
+        - Empty list indicates no results found
+    """
+    from haystack.orchestrator.services.ontology import CellOntologyService
+    import yaml
+    
+    # Parse semicolon-separated terms
+    terms = [term.strip() for term in search_terms.split(";") if term.strip()]
+    
+    if not terms:
+        return "Error: No valid search terms provided"
+    
+    # Deduplicate while preserving order
+    seen = set()
+    unique_terms = []
+    for term in terms:
+        if term.lower() not in seen:
+            seen.add(term.lower())
+            unique_terms.append(term)
+    
+    # Query OLS
+    service = CellOntologyService.get_instance()
+    results = await service.query_ols(search_terms=unique_terms)
+    
+    # Format as YAML
+    return yaml.dump(results, sort_keys=False, indent=2, allow_unicode=True)
+```
+
+### 6.3 Drug-Target Knowledge Tools
 
 ```python
 @tool
@@ -192,7 +412,7 @@ async def find_mechanistically_similar_perturbations(
     ...
 ```
 
-### 6.3 STACK Inference Tools
+### 6.4 STACK Inference Tools
 
 ```python
 @tool
@@ -248,7 +468,7 @@ async def extract_de_genes(
     ...
 ```
 
-### 6.4 Enrichment and Evaluation Tools
+### 6.5 Enrichment and Evaluation Tools
 
 ```python
 @tool
@@ -320,7 +540,7 @@ class GroundingEvaluator:
         ...
 ```
 
-### 6.5 Literature Search Tools
+### 6.6 Literature Search Tools
 
 ```python
 @tool
@@ -384,7 +604,7 @@ async def search_literature_evidence(
     ...
 ```
 
-### 6.6 Tool Input/Output Standards
+### 6.7 Tool Input/Output Standards
 
 - Inputs should be typed, validated, and described in docstrings to support automatic schema generation.
 - Outputs should be structured dictionaries or Pydantic models where possible; avoid free-form strings except for text-heavy content (e.g., full-text paper markdown).

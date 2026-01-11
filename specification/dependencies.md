@@ -42,6 +42,7 @@ dependencies = [
     "langchain-anthropic>=0.1.0",
     "langchain-openai>=0.1.0",
     "langchain-google-genai>=0.1.0",
+    "openai>=1.3.0,<2.0.0",
     
     # Data handling
     "scanpy>=1.10.0",
@@ -50,6 +51,7 @@ dependencies = [
     "numpy>=1.24.0",
     "docling>=2.60.0",
     "lxml>=5.0.0",
+    "pyyaml>=6.0.0",
     
     # API clients
     "httpx>=0.27.0",

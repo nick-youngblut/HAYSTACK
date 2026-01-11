@@ -96,13 +96,22 @@ For OBSERVATIONAL tasks, focus on:
 query_understanding_subagent = create_deep_agent(
     model=model,
     tools=[
-        resolve_cell_type_tool,
+        # Cell Ontology tools (primary for cell type resolution)
+        resolve_cell_type_semantic,
+        get_cell_type_neighbors,
+        query_cell_ontology_ols,
+
+        # Other entity resolution tools
         resolve_perturbation_tool,
         resolve_tissue_tool,
         resolve_disease_tool,
+
+        # Knowledge gathering tools
         get_drug_targets_tool,
         get_pathway_priors_tool,
         get_cell_type_markers_tool,
+
+        # Literature tools
         search_literature_tool,
         acquire_full_text_paper_tool,
     ],
@@ -154,14 +163,21 @@ Be thorough in resolving entities - this information guides prompt selection.
 prompt_generation_subagent = create_deep_agent(
     model=model,
     tools=[
-        search_cells_by_perturbation_tool,
-        search_cells_by_cell_type_tool,
-        semantic_search_cells_tool,
-        find_mechanistically_similar_tool,
-        find_ontology_related_cells_tool,
-        find_donor_context_cells_tool,
-        find_tissue_atlas_cells_tool,
-        rank_prompt_candidates_tool,
+        # Database retrieval tools
+        search_cells_by_perturbation,
+        search_cells_by_cell_type,
+        semantic_search_cells,
+        find_donor_cells,
+        find_reference_cells,
+
+        # Cell Ontology tools (for ontology-guided retrieval)
+        get_cell_type_neighbors,
+        resolve_cell_type_semantic,
+
+        # Strategy execution
+        execute_retrieval_strategy,
+        rank_candidates,
+        select_prompt_cells,
     ],
     system_prompt=PROMPT_GENERATION_PROMPT,
 )
