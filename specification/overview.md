@@ -41,9 +41,9 @@ Traditional STACK usage is open-loop: users manually select prompts, run inferen
 
 ### 1.3 Core Capabilities
 
-- Web-based natural language query interface for perturbation prediction requests
-- Multi-strategy prompt generation leveraging drug-target knowledge, cell ontologies, and vector similarity
-- Automated biological grounding evaluation with integer scoring (1-10)
+- Web-based natural language query interface for perturbational, observational, and hybrid ICL requests
+- Multi-strategy prompt generation leveraging drug-target knowledge, donor context, tissue atlases, and cell ontologies
+- Automated biological grounding evaluation with task-appropriate integer scoring (1-10)
 - Iterative refinement with configurable stopping criteria
 - Polling-based status updates with email notification on completion
 - Run cancellation at any time during execution
@@ -61,8 +61,8 @@ HAYSTACK is deployed as a **FastAPI backend + Next.js frontend** web application
 
 | Goal | Description |
 |------|-------------|
-| G1 | Accept natural language queries describing perturbation prediction tasks via web interface |
-| G2 | Generate biologically-informed prompts using multiple parallel strategies |
+| G1 | Accept natural language queries describing perturbational, observational, and hybrid ICL tasks via web interface |
+| G2 | Generate biologically-informed prompts using multiple parallel strategies by task type |
 | G3 | Execute STACK inference via GCP Batch with GPU support |
 | G4 | Evaluate predictions against biological knowledge bases |
 | G5 | Iteratively refine prompts based on grounding evaluation |
@@ -416,7 +416,7 @@ HAYSTACK uses a combination of state management approaches:
 
 ```python
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, Union
 from enum import Enum
 from datetime import datetime
 
@@ -429,32 +429,59 @@ class PerturbationType(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ICLTaskType(str, Enum):
+    """Types of ICL tasks supported by STACK."""
+    PERTURBATION_NOVEL_CELL_TYPES = "perturbation_novel_cell_types"
+    PERTURBATION_NOVEL_SAMPLES = "perturbation_novel_samples"
+    CELL_TYPE_IMPUTATION = "cell_type_imputation"
+    DONOR_EXPRESSION_PREDICTION = "donor_expression_prediction"
+    CROSS_DATASET_GENERATION = "cross_dataset_generation"
+
+
 class StructuredQuery(BaseModel):
     """Parsed representation of a user query."""
     
     raw_query: str = Field(description="Original user query text")
+    task_type: ICLTaskType = Field(description="Resolved ICL task type")
     
     # Cell type resolution
     cell_type_query: str = Field(description="Extracted cell type from query")
     cell_type_cl_id: Optional[str] = Field(description="Resolved Cell Ontology ID")
     cell_type_synonyms: list[str] = Field(default_factory=list)
     
-    # Perturbation resolution
-    perturbation_query: str = Field(description="Extracted perturbation from query")
-    perturbation_type: PerturbationType
-    perturbation_resolved: Optional[str] = Field(description="Canonical name")
+    # Perturbation resolution (optional for observational tasks)
+    perturbation_query: Optional[str] = Field(default=None, description="Extracted perturbation from query")
+    perturbation_type: Optional[PerturbationType] = None
+    perturbation_resolved: Optional[str] = Field(default=None, description="Canonical name")
     perturbation_external_ids: dict[str, str] = Field(default_factory=dict)
-    
-    # Biological priors
     expected_targets: list[str] = Field(default_factory=list)
     expected_pathways: list[str] = Field(default_factory=list)
+    
+    # Observational context (optional for perturbational tasks)
+    target_donor_id: Optional[str] = Field(default=None, description="Donor to impute for")
+    target_tissue: Optional[str] = Field(default=None, description="Target tissue (UBERON ID)")
+    target_disease_state: Optional[str] = Field(default=None, description="Disease state (MONDO ID)")
+    target_condition: Optional[str] = Field(default=None, description="Free-text condition")
+    reference_donor_id: Optional[str] = Field(default=None, description="Reference donor for query cells")
+    reference_dataset: Optional[str] = Field(default=None, description="Reference dataset for query cells")
+    
+    # Biological context (task-agnostic)
+    expected_marker_genes: list[str] = Field(default_factory=list)
+    expected_tissue_genes: list[str] = Field(default_factory=list)
     literature_context: Optional[str] = None
 
 
 class PromptCandidate(BaseModel):
     """A candidate prompt configuration."""
     
-    strategy: Literal["direct", "mechanistic", "semantic", "ontology"]
+    strategy: Literal[
+        "direct",
+        "mechanistic",
+        "semantic",
+        "ontology",
+        "donor_context",
+        "tissue_atlas",
+    ]
     cell_group_ids: list[str] = Field(description="Selected cell groups for prompt")
     
     # Metadata for ranking
@@ -488,13 +515,33 @@ class GroundingScore(BaseModel):
     improvement_suggestions: list[str]
 
 
+class ObservationalGroundingScore(BaseModel):
+    """Biological grounding evaluation for observational ICL tasks."""
+    
+    # Component scores (1-10)
+    marker_gene_expression: int = Field(ge=1, le=10)
+    tissue_signature_match: int = Field(ge=1, le=10)
+    donor_effect_capture: int = Field(ge=1, le=10)
+    cell_type_coherence: int = Field(ge=1, le=10)
+    
+    # Composite score
+    composite_score: int = Field(ge=1, le=10)
+    
+    # Details
+    marker_genes_detected: dict[str, float]
+    tissue_genes_detected: dict[str, float]
+    donor_signature_genes: list[str]
+
+    # Feedback for next iteration
+    improvement_suggestions: list[str]
+
 class IterationRecord(BaseModel):
     """Record of a single iteration."""
     
     iteration_number: int
     prompt_candidates: list[PromptCandidate]
     selected_prompt: PromptCandidate
-    grounding_score: GroundingScore
+    grounding_score: Union[GroundingScore, ObservationalGroundingScore]
     duration_seconds: float
     
     # Artifacts
@@ -768,14 +815,30 @@ def create_orchestrator(config: HaystackConfig, run_id: str):
 
 **Orchestrator System Prompt**:
 ```
-You are the HAYSTACK orchestrator, an AI system that improves single-cell perturbation predictions through iterative knowledge-guided prompting.
+You are the HAYSTACK orchestrator, an AI system that improves single-cell predictions through iterative knowledge-guided prompting. You support both perturbational and observational in-context learning tasks.
+
+TASK TYPES:
+1. PERTURBATIONAL ICL: Predict effects of drugs/cytokines/genetic perturbations
+   - Prompts: Perturbed cells
+   - Queries: Control cells (unperturbed)
+   - Goal: Generate perturbed expression profiles
+
+2. OBSERVATIONAL ICL: Predict cell type expression in a specific donor/condition
+   - Prompts: Cell types from target donor (the context you want to predict in)
+   - Queries: Cell types from reference donors (providing the cell type template)
+   - Goal: Generate donor-specific cell type expression
+
+3. HYBRID ICL: Cross-dataset cell type generation
+   - Prompts: Cells from dataset A (defining the biological context)
+   - Queries: Cell types from dataset B (providing cell type templates)
+   - Goal: Generate cell types absent from dataset A
 
 Your workflow:
-1. UNDERSTAND: Parse the user's query to identify cell type, perturbation, and expected biology
-2. GENERATE: Create multiple prompt candidates using different strategies
+1. UNDERSTAND: Parse the query to identify task type, cell type(s), and biological context
+2. GENERATE: Create prompt candidates using appropriate strategies for the task type
 3. INFER: Run STACK inference with selected prompts
-4. EVALUATE: Assess biological grounding of predictions (1-10 score)
-5. DECIDE: If score ≥ threshold OR max iterations reached → finalize; else → refine and repeat
+4. EVALUATE: Assess biological grounding using task-appropriate metrics
+5. DECIDE: If score ≥ threshold OR max iterations reached → finalize; else → refine
 
 Key principles:
 - Always explain your reasoning before taking actions
@@ -783,6 +846,11 @@ Key principles:
 - Consider multiple strategies in parallel
 - Learn from evaluation feedback to improve subsequent iterations
 - Be conservative with iteration count; stop when predictions are well-grounded
+
+For OBSERVATIONAL tasks, focus on:
+- Finding reference donors with similar clinical profiles
+- Selecting high-quality reference cell populations
+- Evaluating cell type marker expression and tissue signatures
 ```
 
 ### 5.2 Query Understanding Subagent
@@ -793,8 +861,11 @@ query_understanding_subagent = create_deep_agent(
     tools=[
         resolve_cell_type_tool,
         resolve_perturbation_tool,
+        resolve_tissue_tool,
+        resolve_disease_tool,
         get_drug_targets_tool,
         get_pathway_priors_tool,
+        get_cell_type_markers_tool,
         search_literature_tool,
     ],
     system_prompt=QUERY_UNDERSTANDING_PROMPT,
@@ -805,11 +876,29 @@ query_understanding_subagent = create_deep_agent(
 ```
 You are a biological query understanding agent. Your job is to:
 
-1. Extract cell type and perturbation from natural language queries
-2. Resolve cell types to Cell Ontology IDs using the resolve_cell_type tool
-3. Resolve perturbations to canonical names and external IDs
-4. Retrieve known targets and pathway associations
-5. Search literature for relevant biological context
+1. DETERMINE TASK TYPE:
+   - If query mentions drug/cytokine/perturbation effects → PERTURBATIONAL
+   - If query asks to predict/impute cell types for a donor → OBSERVATIONAL
+   - If query involves cross-dataset generation → HYBRID
+
+2. EXTRACT ENTITIES:
+   For ALL tasks:
+   - Cell type(s) of interest
+   - Resolve to Cell Ontology IDs
+   
+   For PERTURBATIONAL:
+   - Perturbation name and type
+   - Known targets and pathways
+   
+   For OBSERVATIONAL:
+   - Target donor/sample identifier
+   - Tissue type (UBERON)
+   - Disease state (MONDO) if applicable
+   - Reference dataset preferences
+
+3. GATHER BIOLOGICAL CONTEXT:
+   For PERTURBATIONAL: Drug targets, affected pathways
+   For OBSERVATIONAL: Cell type markers, tissue signatures, disease-associated genes
 
 Output a StructuredQuery with all resolved information.
 
@@ -827,6 +916,8 @@ prompt_generation_subagent = create_deep_agent(
         semantic_search_cells_tool,
         find_mechanistically_similar_tool,
         find_ontology_related_cells_tool,
+        find_donor_context_cells_tool,
+        find_tissue_atlas_cells_tool,
         rank_prompt_candidates_tool,
     ],
     system_prompt=PROMPT_GENERATION_PROMPT,
@@ -837,11 +928,28 @@ prompt_generation_subagent = create_deep_agent(
 ```
 You are a prompt generation agent for STACK in-context learning. Your job is to select the best "prompt cells" from the available atlases.
 
-Strategies (use all in parallel):
-1. DIRECT: Find exact matches for cell type and perturbation
-2. MECHANISTIC: Find perturbations sharing targets/pathways with query
-3. SEMANTIC: Use vector similarity for related perturbations
-4. ONTOLOGY: Find related cell types via CL ontology hierarchy
+STRATEGY SELECTION BY TASK TYPE:
+
+For PERTURBATIONAL tasks:
+1. DIRECT: Find exact perturbation + cell type matches
+2. MECHANISTIC: Find perturbations sharing targets/pathways
+3. SEMANTIC: Vector similarity on perturbation descriptions
+4. ONTOLOGY: Related cell types via CL hierarchy
+
+For OBSERVATIONAL tasks:
+1. DONOR_CONTEXT: Find donors with similar clinical profiles
+2. TISSUE_ATLAS: Find high-quality reference cells from atlases
+3. ONTOLOGY: Related cell types for hierarchical fallback
+4. SEMANTIC: Similar sample conditions via embeddings
+
+For HYBRID tasks:
+- Combine strategies from both categories
+- Prioritize cross-dataset compatibility
+
+Remember:
+- For OBSERVATIONAL: Prompt cells come from the TARGET donor (defining context)
+- For OBSERVATIONAL: Query cells come from REFERENCE donors (cell type template)
+- This is OPPOSITE of perturbational where prompt=perturbed, query=control
 
 After generating candidates from each strategy, rank them by:
 - Biological relevance to the query
@@ -862,6 +970,9 @@ grounding_evaluation_subagent = create_deep_agent(
         check_target_activation_tool,
         search_literature_evidence_tool,
         build_gene_network_tool,
+        get_cell_type_markers_tool,
+        get_tissue_signature_tool,
+        identify_donor_signature_tool,
         compute_grounding_score_tool,
     ],
     system_prompt=GROUNDING_EVALUATION_PROMPT,
@@ -872,11 +983,19 @@ grounding_evaluation_subagent = create_deep_agent(
 ```
 You are a biological grounding evaluation agent. Your job is to assess how well STACK predictions align with biological knowledge.
 
-Evaluation criteria (each scored 1-10):
+Evaluation criteria by task type (each scored 1-10):
+
+PERTURBATIONAL:
 1. PATHWAY COHERENCE: Do enriched pathways match expected biology?
 2. TARGET ACTIVATION: Are known targets differentially expressed correctly?
 3. LITERATURE SUPPORT: Do predictions have published evidence?
 4. NETWORK COHERENCE: Do DE genes form connected functional modules?
+
+OBSERVATIONAL:
+1. MARKER GENE EXPRESSION: Are canonical markers expressed as expected?
+2. TISSUE SIGNATURE MATCH: Do predictions match tissue-specific patterns?
+3. DONOR EFFECT CAPTURE: Are donor/disease effects preserved?
+4. CELL TYPE COHERENCE: Is the transcriptional state coherent?
 
 Compute a composite score and provide actionable feedback for improvement.
 
@@ -915,7 +1034,7 @@ async def search_cells_by_perturbation(
 @tool
 async def semantic_search_cells(
     query_text: str,
-    search_type: Literal["perturbation", "cell_type"],
+    search_type: Literal["perturbation", "cell_type", "sample_context"],
     top_k: int = 50,
     similarity_threshold: float = 0.7,
 ) -> list[dict]:
@@ -950,6 +1069,50 @@ async def find_ontology_related_cells(
     
     Returns:
         List of cell groups with ontology distance
+    """
+    ...
+
+
+@tool
+async def find_donor_context_cells(
+    cell_type_cl_id: str,
+    target_donor_id: str,
+    target_tissue: Optional[str] = None,
+    target_disease_state: Optional[str] = None,
+    max_results: int = 50,
+) -> list[dict]:
+    """
+    Find cell groups from donors with similar clinical context.
+    
+    Args:
+        cell_type_cl_id: Target cell type CL ID
+        target_donor_id: Donor to exclude from references
+        target_tissue: Optional UBERON ID
+        target_disease_state: Optional MONDO ID
+        max_results: Max results to return
+    
+    Returns:
+        List of cell groups with donor similarity scores
+    """
+    ...
+
+
+@tool
+async def find_tissue_atlas_cells(
+    cell_type_cl_id: str,
+    target_tissue: Optional[str] = None,
+    max_results: int = 50,
+) -> list[dict]:
+    """
+    Find high-quality reference cell groups from tissue atlases.
+    
+    Args:
+        cell_type_cl_id: Target cell type CL ID
+        target_tissue: Optional UBERON ID
+        max_results: Max results to return
+    
+    Returns:
+        List of reference cell groups ranked by atlas priority and cell count
     """
     ...
 ```
@@ -1095,26 +1258,51 @@ async def run_pathway_enrichment(
 
 @tool
 async def compute_grounding_score(
-    de_genes: list[dict],
-    expected_targets: list[str],
-    expected_pathways: list[str],
-    enrichment_results: dict,
-    literature_evidence: list[dict],
-) -> GroundingScore:
+    query: StructuredQuery,
+    predictions: AnnData,
+    control_or_reference: AnnData,
+) -> Union[GroundingScore, ObservationalGroundingScore]:
     """
     Compute composite biological grounding score.
     
     Args:
-        de_genes: Differentially expressed genes
-        expected_targets: Known perturbation targets
-        expected_pathways: Expected affected pathways
-        enrichment_results: Pathway enrichment results
-        literature_evidence: PubMed evidence
+        query: Parsed query with task type and priors
+        predictions: Predicted AnnData
+        control_or_reference: Control (perturbational) or reference (observational) AnnData
     
     Returns:
-        GroundingScore with component and composite scores
+        GroundingScore or ObservationalGroundingScore with component and composite scores
     """
     ...
+
+
+class GroundingEvaluator:
+    """Unified evaluator that handles both perturbational and observational tasks."""
+    
+    async def evaluate(
+        self,
+        query: StructuredQuery,
+        predictions: AnnData,
+        control_or_reference: AnnData,
+    ) -> Union[GroundingScore, ObservationalGroundingScore]:
+        """
+        Evaluate predictions based on task type.
+        """
+        if query.task_type in [
+            ICLTaskType.PERTURBATION_NOVEL_CELL_TYPES,
+            ICLTaskType.PERTURBATION_NOVEL_SAMPLES,
+        ]:
+            return await self._evaluate_perturbational(query, predictions, control_or_reference)
+        return await self._evaluate_observational(query, predictions, control_or_reference)
+    
+    async def _evaluate_observational(
+        self,
+        query: StructuredQuery,
+        predictions: AnnData,
+        reference: AnnData,
+    ) -> ObservationalGroundingScore:
+        """Evaluate observational ICL predictions."""
+        ...
 ```
 
 ---
@@ -1230,7 +1418,12 @@ CREATE TABLE cells (
     -- Additional metadata
     tissue_original VARCHAR(256),
     tissue_uberon_id VARCHAR(32),
+    tissue_name VARCHAR(256),
     donor_id VARCHAR(64),
+    disease_mondo_id VARCHAR(32),
+    disease_name VARCHAR(256),
+    sample_condition VARCHAR(256),
+    sample_metadata JSONB DEFAULT '{}',
     
     -- External IDs (JSONB for flexibility)
     perturbation_external_ids JSONB DEFAULT '{}',
@@ -1244,6 +1437,7 @@ CREATE TABLE cells (
     -- Text embeddings for semantic search (text-embedding-3-large, 1536 dim)
     perturbation_embedding vector(1536),
     cell_type_embedding vector(1536),
+    sample_context_embedding vector(1536),
     
     -- Timestamps
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1256,6 +1450,13 @@ CREATE TABLE cell_groups (
     perturbation_name VARCHAR(256),
     cell_type_cl_id VARCHAR(32),
     donor_id VARCHAR(64),
+    tissue_uberon_id VARCHAR(32),
+    tissue_name VARCHAR(256),
+    disease_mondo_id VARCHAR(32),
+    disease_name VARCHAR(256),
+    sample_condition VARCHAR(256),
+    sample_metadata JSONB DEFAULT '{}',
+    is_reference_sample BOOLEAN DEFAULT FALSE,
     
     n_cells INT NOT NULL,
     cell_indices INT[] NOT NULL,
@@ -1266,7 +1467,26 @@ CREATE TABLE cell_groups (
     has_control BOOLEAN DEFAULT FALSE,
     control_group_id VARCHAR(64),
     
+    -- Representative embeddings (mean of cells in group)
+    perturbation_embedding vector(1536),
+    cell_type_embedding vector(1536),
+    sample_context_embedding vector(1536),
+    
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Donor lookup table
+CREATE TABLE donors (
+    donor_id VARCHAR(64) PRIMARY KEY,
+    dataset VARCHAR(32) NOT NULL,
+    age_category VARCHAR(32),
+    sex VARCHAR(16),
+    disease_states TEXT[],
+    disease_names TEXT[],
+    tissue_types TEXT[],
+    n_cells INT,
+    cell_types_present TEXT[],
+    clinical_embedding vector(1536)
 );
 
 -- Perturbation lookup table
@@ -1279,6 +1499,20 @@ CREATE TABLE perturbations (
     datasets_present TEXT[],
     total_cells INT,
     cell_types_present TEXT[]
+);
+
+-- Unified conditions table
+CREATE TABLE conditions (
+    condition_id VARCHAR(64) PRIMARY KEY,
+    condition_type VARCHAR(32) NOT NULL,
+    perturbation_name VARCHAR(256),
+    perturbation_type VARCHAR(32),
+    targets TEXT[],
+    pathways TEXT[],
+    disease_mondo_id VARCHAR(32),
+    tissue_uberon_id VARCHAR(32),
+    clinical_attributes JSONB DEFAULT '{}',
+    condition_embedding vector(1536)
 );
 
 -- Cell type lookup table
@@ -1333,6 +1567,8 @@ CREATE INDEX idx_cells_tissue ON cells(tissue_uberon_id);
 CREATE INDEX idx_cells_is_control ON cells(is_control);
 CREATE INDEX idx_cells_group ON cells(group_id);
 CREATE INDEX idx_cells_donor ON cells(donor_id);
+CREATE INDEX idx_cells_disease ON cells(disease_mondo_id);
+CREATE INDEX idx_cells_condition ON cells(sample_condition);
 
 -- HNSW vector indexes for similarity search
 CREATE INDEX idx_cells_perturbation_embedding ON cells 
@@ -1343,9 +1579,16 @@ CREATE INDEX idx_cells_cell_type_embedding ON cells
 USING hnsw (cell_type_embedding vector_cosine_ops)
 WITH (m = 16, ef_construction = 64);
 
+CREATE INDEX idx_cells_sample_context_embedding ON cells 
+USING hnsw (sample_context_embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
 -- Index on synonym table
 CREATE INDEX idx_synonyms_synonym ON synonyms(synonym);
 CREATE INDEX idx_synonyms_type ON synonyms(entity_type);
+
+CREATE INDEX idx_donors_dataset ON donors(dataset);
+CREATE INDEX idx_conditions_type ON conditions(condition_type);
 
 -- Index on runs table
 CREATE INDEX idx_runs_user ON runs(user_email);
@@ -1360,7 +1603,7 @@ CREATE INDEX idx_runs_created ON runs(created_at DESC);
 CREATE ROLE haystack_app WITH LOGIN PASSWORD 'secure_password';
 GRANT CONNECT ON DATABASE haystack TO haystack_app;
 GRANT USAGE ON SCHEMA public TO haystack_app;
-GRANT SELECT ON cells, cell_groups, perturbations, cell_types, synonyms TO haystack_app;
+GRANT SELECT ON cells, cell_groups, donors, conditions, perturbations, cell_types, synonyms TO haystack_app;
 GRANT SELECT, INSERT, UPDATE ON runs TO haystack_app;
 GRANT USAGE, SELECT ON SEQUENCE runs_run_id_seq TO haystack_app;
 
@@ -3586,8 +3829,12 @@ jobs:
 ```python
 predictions.obs:
     - cell_id: str
+    - task_type: str
     - cell_type_query: str
-    - perturbation_query: str
+    - perturbation_query: Optional[str]
+    - target_donor_id: Optional[str]
+    - target_tissue: Optional[str]
+    - target_disease_state: Optional[str]
     - prompt_strategy: str
     - iteration: int
     - grounding_score: int
@@ -3954,7 +4201,7 @@ def compute_composite_score(
     network: int
 ) -> int:
     """
-    Compute composite grounding score.
+    Compute composite grounding score (perturbational tasks).
     
     Args:
         pathway: Pathway coherence score (1-10)
@@ -3993,3 +4240,5 @@ See `prompt-retrieval.md` for detailed specification of the cell retrieval strat
 - Mechanistic Match Strategy
 - Semantic Match Strategy
 - Ontology-Guided Strategy
+- Donor Context Strategy
+- Tissue Atlas Strategy

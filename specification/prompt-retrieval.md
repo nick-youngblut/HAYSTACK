@@ -10,11 +10,13 @@
 6. [Mechanistic Match Strategy](#6-mechanistic-match-strategy)
 7. [Semantic Match Strategy](#7-semantic-match-strategy)
 8. [Ontology-Guided Strategy](#8-ontology-guided-strategy)
-9. [Candidate Ranking and Selection](#9-candidate-ranking-and-selection)
-10. [Index Building Pipeline](#10-index-building-pipeline)
-11. [GCP Cloud SQL Configuration](#11-gcp-cloud-sql-configuration)
-12. [Python Database Client](#12-python-database-client)
-13. [Open Questions](#13-open-questions)
+9. [Donor Context Strategy](#9-donor-context-strategy)
+10. [Tissue Atlas Strategy](#10-tissue-atlas-strategy)
+11. [Candidate Ranking and Selection](#11-candidate-ranking-and-selection)
+12. [Index Building Pipeline](#12-index-building-pipeline)
+13. [GCP Cloud SQL Configuration](#13-gcp-cloud-sql-configuration)
+14. [Python Database Client](#14-python-database-client)
+15. [Open Questions](#15-open-questions)
 
 ---
 
@@ -27,18 +29,19 @@ HAYSTACK must select appropriate "prompt cells" for STACK's in-context learning 
 - **OpenProblems**: ~500K cells, 147 drug conditions, 3 donors
 - **Tabula Sapiens**: ~500K cells, unperturbed, 25 tissues, 24 donors
 
-Given a natural language query (e.g., "How would lung fibroblasts respond to TGF-beta?"), the system must:
-1. Understand what the user is asking for (cell type, perturbation)
-2. Find the most biologically relevant prompt cells from available data
-3. Handle cases where exact matches don't exist
+Given a natural language query (e.g., "How would lung fibroblasts respond to TGF-beta?" or "Impute missing fibroblasts for donor A"), the system must:
+1. Determine the ICL task type (perturbational, observational, hybrid)
+2. Resolve the core biological entities (cell types, perturbations, donors, tissues)
+3. Find the most biologically relevant prompt cells from available data
+4. Handle cases where exact matches don't exist
 
 ### 1.2 Key Design Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Database | GCP Cloud SQL (PostgreSQL + pgvector) | Full SQL for agent queries, HNSW for vectors, production-ready at 10M+ scale |
-| Multiple embeddings per cell | Yes (text-based) | Enables semantic similarity search for perturbations and cell types |
-| Strategy chaining | Yes | Higher-level strategies (Mechanistic, Ontology) produce filters; lower-level strategies (Direct, Semantic) retrieve cells |
+| Multiple embeddings per cell | Yes (text-based) | Enables semantic similarity search for perturbations, cell types, and sample context |
+| Strategy chaining | Yes | Higher-level strategies (Mechanistic, Ontology, Donor Context) produce filters; lower-level strategies (Direct, Semantic, Tissue Atlas) retrieve cells |
 | Metadata harmonization | Pre-indexed | Harmonization happens at index build time, not query time |
 | Retrieval granularity | Cell groups | Return groups of cells sharing (perturbation, cell_type, donor), not individual cells |
 
@@ -103,6 +106,10 @@ Given a natural language query (e.g., "How would lung fibroblasts respond to TGF
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+For observational tasks, the retrieval layer adds two strategies:
+- **DONOR_CONTEXT**: find donors with similar clinical context (tissue, disease, demographics)
+- **TISSUE_ATLAS**: pull high-quality reference populations from large atlases
+
 ---
 
 ## 2. Atlas Data Model
@@ -153,18 +160,27 @@ class HarmonizedCellMetadata(BaseModel):
     # Tissue/organ (for Tabula Sapiens)
     tissue_original: Optional[str] = Field(description="Original tissue annotation")
     tissue_uberon_id: Optional[str] = Field(description="UBERON ID")
+    tissue_name: Optional[str] = Field(description="Canonical tissue name")
     
     # Donor information
     donor_id: str = Field(description="Donor identifier (prefixed with dataset)")
+    donor_age_category: Optional[str] = Field(description="young, middle-aged, elderly")
+    donor_sex: Optional[str] = Field(description="Sex if available")
     
     # Quality metrics
     n_genes: int = Field(description="Number of detected genes")
     total_counts: float = Field(description="Total UMI counts")
+
+    # Observational metadata
+    disease_mondo_id: Optional[str] = Field(description="Disease MONDO ID")
+    disease_name: Optional[str] = Field(description="Disease name")
+    sample_condition: Optional[str] = Field(description="Sample condition (healthy, AKI, CKD)")
+    sample_metadata: dict[str, str] = Field(default_factory=dict, description="Additional metadata")
 ```
 
 ### 2.2 Cell Groups
 
-Cells are grouped for retrieval efficiency. A group contains cells that share the same (perturbation, cell_type, donor).
+Cells are grouped for retrieval efficiency. A group contains cells that share the same (perturbation, cell_type, donor), with observational metadata (tissue, disease, condition) stored at the group level.
 
 ```python
 class CellGroup(BaseModel):
@@ -177,6 +193,13 @@ class CellGroup(BaseModel):
     perturbation_name: Optional[str]
     cell_type_cl_id: Optional[str]
     donor_id: str
+    tissue_uberon_id: Optional[str] = None
+    tissue_name: Optional[str] = None
+    disease_mondo_id: Optional[str] = None
+    disease_name: Optional[str] = None
+    sample_condition: Optional[str] = None
+    sample_metadata: dict[str, str] = Field(default_factory=dict)
+    is_reference_sample: bool = False
     
     # Group statistics
     n_cells: int
@@ -238,12 +261,13 @@ HAYSTACK uses **GCP Cloud SQL (PostgreSQL 15 + pgvector)** as its unified databa
 
 ### 3.2 Multi-Embedding Design
 
-Each cell record stores two text embedding vectors:
+Each cell record stores multiple text embedding vectors:
 
 | Column | Model | Dimension | Purpose |
 |--------|-------|-----------|---------|
 | `perturbation_embedding` | text-embedding-3-large | 1536 | Semantic perturbation search |
 | `cell_type_embedding` | text-embedding-3-large | 1536 | Semantic cell type search |
+| `sample_context_embedding` | text-embedding-3-large | 1536 | Donor/tissue/disease similarity |
 
 > **Note**: STACK cell embeddings (transcriptomic state) are excluded from MVP. They would require running STACK inference to generate query embeddings, adding complexity. Text embeddings are sufficient for the retrieval strategies. Cell embeddings may be added in a future version for refinement iterations.
 
@@ -289,6 +313,28 @@ def generate_cell_type_text(metadata: HarmonizedCellMetadata) -> str:
     
     return " ".join(parts)
     # Example: "fibroblast from lung (mesenchymal cell > stromal cell > connective tissue cell)"
+
+
+def generate_sample_context_text(metadata: HarmonizedCellMetadata) -> str:
+    """Generate text description for sample context embedding."""
+    parts = []
+    
+    if metadata.tissue_name or metadata.tissue_original:
+        parts.append(f"tissue: {metadata.tissue_name or metadata.tissue_original}")
+    
+    if metadata.disease_name or metadata.disease_mondo_id:
+        parts.append(f"disease: {metadata.disease_name or metadata.disease_mondo_id}")
+    
+    if metadata.sample_condition:
+        parts.append(f"condition: {metadata.sample_condition}")
+    
+    if metadata.donor_age_category:
+        parts.append(f"age: {metadata.donor_age_category}")
+    
+    if metadata.donor_sex:
+        parts.append(f"sex: {metadata.donor_sex}")
+    
+    return "; ".join(parts) or "unknown clinical context"
 ```
 
 ### 3.4 Complete Schema
@@ -320,7 +366,12 @@ CREATE TABLE cells (
     -- Additional metadata
     tissue_original VARCHAR(256),
     tissue_uberon_id VARCHAR(32),
+    tissue_name VARCHAR(256),
     donor_id VARCHAR(64),
+    disease_mondo_id VARCHAR(32),
+    disease_name VARCHAR(256),
+    sample_condition VARCHAR(256),
+    sample_metadata JSONB DEFAULT '{}',
     
     -- External IDs (JSONB for flexibility)
     perturbation_external_ids JSONB DEFAULT '{}',
@@ -334,6 +385,7 @@ CREATE TABLE cells (
     -- Text embeddings for semantic search (text-embedding-3-large, 1536 dim)
     perturbation_embedding vector(1536),
     cell_type_embedding vector(1536),
+    sample_context_embedding vector(1536),
     
     -- Timestamps
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -347,6 +399,13 @@ CREATE TABLE cell_groups (
     cell_type_cl_id VARCHAR(32),
     cell_type_name VARCHAR(256),
     donor_id VARCHAR(64),
+    tissue_uberon_id VARCHAR(32),
+    tissue_name VARCHAR(256),
+    disease_mondo_id VARCHAR(32),
+    disease_name VARCHAR(256),
+    sample_condition VARCHAR(256),
+    sample_metadata JSONB DEFAULT '{}',
+    is_reference_sample BOOLEAN DEFAULT FALSE,
     
     n_cells INT NOT NULL,
     cell_indices INT[] NOT NULL,
@@ -360,8 +419,31 @@ CREATE TABLE cell_groups (
     -- Representative embeddings (mean of cells in group)
     perturbation_embedding vector(1536),
     cell_type_embedding vector(1536),
+    sample_context_embedding vector(1536),
     
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Donor lookup table for observational similarity search
+CREATE TABLE donors (
+    donor_id VARCHAR(64) PRIMARY KEY,
+    dataset VARCHAR(32) NOT NULL,
+    
+    -- Demographics
+    age_category VARCHAR(32),
+    sex VARCHAR(16),
+    
+    -- Clinical metadata
+    disease_states TEXT[],
+    disease_names TEXT[],
+    tissue_types TEXT[],
+    
+    -- Statistics
+    n_cells INT,
+    cell_types_present TEXT[],
+    
+    -- Embedding for donor similarity search
+    clinical_embedding vector(1536)
 );
 
 -- Perturbation lookup table (for Mechanistic Match)
@@ -374,6 +456,26 @@ CREATE TABLE perturbations (
     datasets_present TEXT[],
     total_cells INT,
     cell_types_present TEXT[]
+);
+
+-- Unified conditions table for perturbations and observational contexts
+CREATE TABLE conditions (
+    condition_id VARCHAR(64) PRIMARY KEY,
+    condition_type VARCHAR(32) NOT NULL,  -- perturbation, disease, demographic
+    
+    -- Perturbations
+    perturbation_name VARCHAR(256),
+    perturbation_type VARCHAR(32),
+    targets TEXT[],
+    pathways TEXT[],
+    
+    -- Observational conditions
+    disease_mondo_id VARCHAR(32),
+    tissue_uberon_id VARCHAR(32),
+    clinical_attributes JSONB DEFAULT '{}',
+    
+    -- Unified embedding
+    condition_embedding vector(1536)
 );
 
 -- Cell type lookup table (for Ontology-Guided)
@@ -404,6 +506,8 @@ CREATE INDEX idx_cells_tissue ON cells(tissue_uberon_id);
 CREATE INDEX idx_cells_is_control ON cells(is_control);
 CREATE INDEX idx_cells_group ON cells(group_id);
 CREATE INDEX idx_cells_donor ON cells(donor_id);
+CREATE INDEX idx_cells_disease ON cells(disease_mondo_id);
+CREATE INDEX idx_cells_condition ON cells(sample_condition);
 
 -- HNSW vector indexes for similarity search
 -- Note: Build these AFTER loading data for best performance
@@ -424,6 +528,10 @@ CREATE INDEX idx_groups_cell_type_embedding ON cell_groups
 USING hnsw (cell_type_embedding vector_cosine_ops)
 WITH (m = 16, ef_construction = 64);
 
+CREATE INDEX idx_groups_sample_context_embedding ON cell_groups
+USING hnsw (sample_context_embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
 -- Index on synonym table
 CREATE INDEX idx_synonyms_synonym ON synonyms(synonym);
 CREATE INDEX idx_synonyms_synonym_lower ON synonyms(LOWER(synonym));
@@ -436,6 +544,8 @@ CREATE INDEX idx_perturbations_pathways ON perturbations USING GIN(pathways);
 
 CREATE INDEX idx_cell_types_parent ON cell_types USING GIN(parent_cl_ids);
 CREATE INDEX idx_cell_types_child ON cell_types USING GIN(child_cl_ids);
+CREATE INDEX idx_donors_dataset ON donors(dataset);
+CREATE INDEX idx_conditions_type ON conditions(condition_type);
 ```
 
 ---
@@ -525,9 +635,23 @@ class StrategyOrchestrator:
         Args:
             db: Async database client
         """
-        self.strategies = [
+        self.perturbational_strategies = [
             DirectMatchStrategy(db),
             MechanisticMatchStrategy(db),
+            SemanticMatchStrategy(db),
+            OntologyGuidedStrategy(db),
+        ]
+        self.observational_strategies = [
+            DonorContextStrategy(db),
+            TissueAtlasStrategy(db),
+            SemanticMatchStrategy(db),
+            OntologyGuidedStrategy(db),
+        ]
+        self.hybrid_strategies = [
+            DirectMatchStrategy(db),
+            MechanisticMatchStrategy(db),
+            DonorContextStrategy(db),
+            TissueAtlasStrategy(db),
             SemanticMatchStrategy(db),
             OntologyGuidedStrategy(db),
         ]
@@ -550,9 +674,22 @@ class StrategyOrchestrator:
         import asyncio
         
         # Run strategies in parallel
+        if query.task_type in [
+            ICLTaskType.PERTURBATION_NOVEL_CELL_TYPES,
+            ICLTaskType.PERTURBATION_NOVEL_SAMPLES,
+        ]:
+            strategies = self.perturbational_strategies
+        elif query.task_type in [
+            ICLTaskType.CELL_TYPE_IMPUTATION,
+            ICLTaskType.DONOR_EXPRESSION_PREDICTION,
+        ]:
+            strategies = self.observational_strategies
+        else:
+            strategies = self.hybrid_strategies
+        
         tasks = [
             strategy.retrieve(query, max_results=max_per_strategy)
-            for strategy in self.strategies
+            for strategy in strategies
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -560,7 +697,7 @@ class StrategyOrchestrator:
         all_candidates = []
         seen_groups = set()
         
-        for strategy, result in zip(self.strategies, results):
+        for strategy, result in zip(strategies, results):
             if isinstance(result, Exception):
                 logger.warning(f"Strategy {strategy.strategy_name} failed: {result}")
                 continue
@@ -933,7 +1070,7 @@ class MechanisticMatchStrategy(RetrievalStrategy):
 
 ### 7.1 Description
 
-Semantic Match uses vector similarity search to find cells whose perturbations or cell types are semantically similar to the query, even if they don't share explicit targets or ontology relationships.
+Semantic Match uses vector similarity search to find cells whose perturbations, cell types, or sample contexts are semantically similar to the query, even if they don't share explicit targets or ontology relationships. For observational tasks, it uses the sample context embedding to match tissue/disease/condition descriptions.
 
 ### 7.2 Implementation
 
@@ -966,10 +1103,10 @@ class SemanticMatchStrategy(RetrievalStrategy):
         Find cell groups via vector similarity.
         
         Strategy:
-        1. Generate embedding for perturbation query
+        1. Generate embedding for perturbation query (perturbational tasks)
         2. Generate embedding for cell type query
-        3. Search for similar perturbations
-        4. Search for similar cell types
+        3. Generate embedding for sample context (observational tasks)
+        4. Search for similar perturbations, cell types, and contexts
         5. Combine with weighted scores
         """
         candidates = []
@@ -1000,6 +1137,23 @@ class SemanticMatchStrategy(RetrievalStrategy):
                 exclude_groups={c.group_id for c in candidates},
             )
             candidates.extend(ct_matches)
+        
+        # Search by sample context similarity (observational)
+        if query.task_type in [
+            ICLTaskType.CELL_TYPE_IMPUTATION,
+            ICLTaskType.DONOR_EXPRESSION_PREDICTION,
+        ]:
+            context_embedding = await self.embedding_client.embed_text(
+                generate_sample_context_query_text(query)
+            )
+            ctx_matches = await self._vector_search(
+                embedding=context_embedding,
+                search_type="sample_context",
+                cell_type_filter=query.cell_type_cl_id,
+                max_results=max_results // 2,
+                exclude_groups={c.group_id for c in candidates},
+            )
+            candidates.extend(ctx_matches)
         
         return candidates
     
@@ -1256,7 +1410,102 @@ class OntologyGuidedStrategy(RetrievalStrategy):
 
 ---
 
-## 9. Candidate Ranking and Selection
+## 9. Donor Context Strategy
+
+### 9.1 Purpose
+
+The Donor Context strategy selects reference cell groups from donors with similar clinical context to the target donor for observational ICL tasks. It prioritizes matching tissue, disease state, and donor demographics before falling back to embedding similarity.
+
+### 9.2 Retrieval Logic
+
+```python
+class DonorContextStrategy(RetrievalStrategy):
+    """Find cells from donors with similar clinical context."""
+    
+    @property
+    def strategy_name(self) -> str:
+        return "donor_context"
+    
+    async def retrieve(
+        self,
+        query: StructuredQuery,
+        max_results: int = 50,
+        filters: Optional[dict] = None,
+    ) -> list[CellGroupCandidate]:
+        context_text = self._build_context_text(query)
+        embedding = await self.embedder.embed(context_text)
+        
+        sql = """
+            SELECT 
+                g.group_id,
+                g.dataset,
+                g.cell_type_name,
+                g.cell_type_cl_id,
+                g.donor_id,
+                g.tissue_name,
+                g.disease_name,
+                g.n_cells,
+                1 - (d.clinical_embedding <=> $1::vector) as donor_similarity
+            FROM cell_groups g
+            JOIN donors d ON g.donor_id = d.donor_id
+            WHERE g.cell_type_cl_id = $2
+              AND g.donor_id != $3
+              AND ($4::text IS NULL OR g.tissue_uberon_id = $4)
+              AND ($5::text IS NULL OR g.disease_mondo_id = $5)
+            ORDER BY d.clinical_embedding <=> $1::vector
+            LIMIT $6
+        """
+        ...
+```
+
+## 10. Tissue Atlas Strategy
+
+### 10.1 Purpose
+
+The Tissue Atlas strategy selects high-quality reference cell populations from curated atlases for observational ICL tasks. It prioritizes comprehensive atlases (Tabula Sapiens) and tissue-specific datasets with large cell counts.
+
+### 10.2 Retrieval Logic
+
+```python
+class TissueAtlasStrategy(RetrievalStrategy):
+    """Find cells from comprehensive tissue atlases."""
+    
+    @property
+    def strategy_name(self) -> str:
+        return "tissue_atlas"
+    
+    async def retrieve(
+        self,
+        query: StructuredQuery,
+        max_results: int = 50,
+        filters: Optional[dict] = None,
+    ) -> list[CellGroupCandidate]:
+        sql = """
+            SELECT 
+                g.group_id,
+                g.dataset,
+                g.cell_type_name,
+                g.cell_type_cl_id,
+                g.donor_id,
+                g.tissue_name,
+                g.n_cells,
+                g.mean_n_genes
+            FROM cell_groups g
+            WHERE g.cell_type_cl_id = $1
+              AND g.is_reference_sample = TRUE
+              AND ($2::text IS NULL OR g.tissue_uberon_id = $2)
+            ORDER BY 
+                CASE g.dataset 
+                    WHEN 'tabula_sapiens' THEN 1 
+                    ELSE 2 
+                END,
+                g.n_cells DESC
+            LIMIT $3
+        """
+        ...
+```
+
+## 11. Candidate Ranking and Selection
 
 ### 9.1 Ranking Algorithm
 
@@ -1398,7 +1647,7 @@ class CandidateRanker:
 
 ---
 
-## 10. Index Building Pipeline
+## 12. Index Building Pipeline
 
 ### 10.1 Overview
 
@@ -1467,6 +1716,7 @@ async def build_haystack_index(
         print("Step 3: Generating text descriptions...")
         perturbation_texts = [generate_perturbation_text(m) for m in all_metadata]
         cell_type_texts = [generate_cell_type_text(m) for m in all_metadata]
+        sample_context_texts = [generate_sample_context_text(m) for m in all_metadata]
         
         # Step 4: Compute text embeddings (batched)
         print("Step 4: Computing text embeddings...")
@@ -1476,6 +1726,9 @@ async def build_haystack_index(
         cell_type_embeddings = await batch_embed_texts(
             embedding_client, cell_type_texts, batch_size
         )
+        sample_context_embeddings = await batch_embed_texts(
+            embedding_client, sample_context_texts, batch_size
+        )
         
         # Step 5: Load into PostgreSQL
         print("Step 5: Loading into PostgreSQL...")
@@ -1484,11 +1737,18 @@ async def build_haystack_index(
             metadata=all_metadata,
             perturbation_embeddings=perturbation_embeddings,
             cell_type_embeddings=cell_type_embeddings,
+            sample_context_embeddings=sample_context_embeddings,
         )
         
         # Step 6: Load cell groups
         print("Step 6: Loading cell groups...")
-        await load_groups_to_postgres(db, cell_groups, perturbation_embeddings, cell_type_embeddings)
+        await load_groups_to_postgres(
+            db,
+            cell_groups,
+            perturbation_embeddings,
+            cell_type_embeddings,
+            sample_context_embeddings,
+        )
         
         # Step 7: Build HNSW indexes
         print("Step 7: Building HNSW indexes...")
@@ -1533,6 +1793,7 @@ async def load_cells_to_postgres(
     metadata: list[HarmonizedCellMetadata],
     perturbation_embeddings: list[list[float]],
     cell_type_embeddings: list[list[float]],
+    sample_context_embeddings: list[list[float]],
     batch_size: int = 5000,
 ):
     """Load cell data into PostgreSQL in batches."""
@@ -1541,6 +1802,7 @@ async def load_cells_to_postgres(
             batch_meta = metadata[i:i + batch_size]
             batch_pert_emb = perturbation_embeddings[i:i + batch_size]
             batch_ct_emb = cell_type_embeddings[i:i + batch_size]
+            batch_ctx_emb = sample_context_embeddings[i:i + batch_size]
             
             # Prepare batch insert
             values = [
@@ -1557,7 +1819,12 @@ async def load_cells_to_postgres(
                     m.is_control,
                     m.tissue_original,
                     m.tissue_uberon_id,
+                    m.tissue_name,
                     m.donor_id,
+                    m.disease_mondo_id,
+                    m.disease_name,
+                    m.sample_condition,
+                    json.dumps(m.sample_metadata),
                     json.dumps(m.perturbation_external_ids),
                     m.perturbation_targets,
                     m.perturbation_pathways,
@@ -1565,8 +1832,11 @@ async def load_cells_to_postgres(
                     m.total_counts,
                     pert_emb,
                     ct_emb,
+                    ctx_emb,
                 )
-                for m, pert_emb, ct_emb in zip(batch_meta, batch_pert_emb, batch_ct_emb)
+                for m, pert_emb, ct_emb, ctx_emb in zip(
+                    batch_meta, batch_pert_emb, batch_ct_emb, batch_ctx_emb
+                )
             ]
             
             await conn.executemany(
@@ -1575,11 +1845,12 @@ async def load_cells_to_postgres(
                     cell_index, dataset, group_id,
                     cell_type_original, cell_type_cl_id, cell_type_name,
                     perturbation_original, perturbation_name, perturbation_type, is_control,
-                    tissue_original, tissue_uberon_id, donor_id,
+                    tissue_original, tissue_uberon_id, tissue_name, donor_id,
+                    disease_mondo_id, disease_name, sample_condition, sample_metadata,
                     perturbation_external_ids, perturbation_targets, perturbation_pathways,
                     n_genes, total_counts,
-                    perturbation_embedding, cell_type_embedding
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                    perturbation_embedding, cell_type_embedding, sample_context_embedding
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
                 """,
                 values,
             )
@@ -1594,8 +1865,10 @@ async def build_hnsw_indexes(db: HaystackDatabase):
         # Drop existing indexes if they exist
         await conn.execute("DROP INDEX IF EXISTS idx_cells_perturbation_embedding")
         await conn.execute("DROP INDEX IF EXISTS idx_cells_cell_type_embedding")
+        await conn.execute("DROP INDEX IF EXISTS idx_cells_sample_context_embedding")
         await conn.execute("DROP INDEX IF EXISTS idx_groups_perturbation_embedding")
         await conn.execute("DROP INDEX IF EXISTS idx_groups_cell_type_embedding")
+        await conn.execute("DROP INDEX IF EXISTS idx_groups_sample_context_embedding")
         
         # Build new indexes
         print("  Building perturbation embedding index on cells...")
@@ -1612,6 +1885,13 @@ async def build_hnsw_indexes(db: HaystackDatabase):
             WITH (m = 16, ef_construction = 64)
         """)
         
+        print("  Building sample context embedding index on cells...")
+        await conn.execute("""
+            CREATE INDEX idx_cells_sample_context_embedding ON cells 
+            USING hnsw (sample_context_embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
+        """)
+        
         print("  Building perturbation embedding index on groups...")
         await conn.execute("""
             CREATE INDEX idx_groups_perturbation_embedding ON cell_groups
@@ -1625,11 +1905,18 @@ async def build_hnsw_indexes(db: HaystackDatabase):
             USING hnsw (cell_type_embedding vector_cosine_ops)
             WITH (m = 16, ef_construction = 64)
         """)
+        
+        print("  Building sample context embedding index on groups...")
+        await conn.execute("""
+            CREATE INDEX idx_groups_sample_context_embedding ON cell_groups
+            USING hnsw (sample_context_embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 64)
+        """)
 ```
 
 ---
 
-## 11. GCP Cloud SQL Configuration
+## 13. GCP Cloud SQL Configuration
 
 ### 11.1 Instance Setup
 
@@ -1741,7 +2028,7 @@ class HaystackDatabase:
 
 ---
 
-## 12. Python Database Client
+## 14. Python Database Client
 
 ### 12.1 Complete Client Implementation
 
@@ -1836,7 +2123,7 @@ class HaystackDatabase:
         
         Args:
             query_embedding: Query vector (1536 dim)
-            search_type: 'perturbation' or 'cell_type'
+            search_type: 'perturbation', 'cell_type', or 'sample_context'
             top_k: Number of results
             filters: Optional SQL filters
         
@@ -1941,7 +2228,7 @@ class HaystackDatabase:
 
 ---
 
-## 13. Open Questions
+## 15. Open Questions
 
 ### 13.1 Resolved Questions
 
