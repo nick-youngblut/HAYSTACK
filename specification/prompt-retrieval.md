@@ -299,8 +299,12 @@ def generate_perturbation_text(metadata: HarmonizedCellMetadata) -> str:
     # Example: "TGF-beta (cytokine) targeting TGFBR1, TGFBR2, SMAD2 affecting TGF-beta signaling, EMT"
 
 
-def generate_cell_type_text(metadata: HarmonizedCellMetadata) -> str:
-    """Generate text description for cell type embedding."""
+async def generate_cell_type_text(metadata: HarmonizedCellMetadata) -> str:
+    """
+    Generate text description for cell type embedding.
+    
+    Includes Cell Ontology lineage for richer semantic matching.
+    """
     parts = [metadata.cell_type_name or metadata.cell_type_original]
     
     if metadata.tissue_original:
@@ -308,9 +312,14 @@ def generate_cell_type_text(metadata: HarmonizedCellMetadata) -> str:
     
     # Add lineage information from Cell Ontology
     if metadata.cell_type_cl_id:
-        lineage = get_cl_lineage(metadata.cell_type_cl_id)
+        ontology_service = CellOntologyService.get_instance()
+        lineage = await ontology_service.get_lineage(
+            metadata.cell_type_cl_id,
+            max_depth=3,
+        )
         if lineage:
-            parts.append(f"({' > '.join(lineage[:3])})")
+            # Format: "fibroblast (mesenchymal cell > stromal cell > connective tissue cell)"
+            parts.append(f"({' > '.join(lineage)})")
     
     return " ".join(parts)
     # Example: "fibroblast from lung (mesenchymal cell > stromal cell > connective tissue cell)"
@@ -483,9 +492,8 @@ CREATE TABLE conditions (
 CREATE TABLE cell_types (
     cell_type_cl_id VARCHAR(32) PRIMARY KEY,
     cell_type_name VARCHAR(256) NOT NULL,
-    lineage TEXT[],
-    parent_cl_ids TEXT[],
-    child_cl_ids TEXT[],
+    lineage_cl_ids TEXT[],
+    lineage_names TEXT[],
     datasets_present TEXT[],
     total_cells INT,
     perturbations_present TEXT[]
@@ -543,8 +551,7 @@ CREATE INDEX idx_perturbations_type ON perturbations(perturbation_type);
 CREATE INDEX idx_perturbations_targets ON perturbations USING GIN(targets);
 CREATE INDEX idx_perturbations_pathways ON perturbations USING GIN(pathways);
 
-CREATE INDEX idx_cell_types_parent ON cell_types USING GIN(parent_cl_ids);
-CREATE INDEX idx_cell_types_child ON cell_types USING GIN(child_cl_ids);
+CREATE INDEX idx_cell_types_lineage ON cell_types USING GIN(lineage_cl_ids);
 CREATE INDEX idx_donors_dataset ON donors(dataset);
 CREATE INDEX idx_conditions_type ON conditions(condition_type);
 ```
@@ -609,6 +616,7 @@ class CellGroupCandidate(BaseModel):
     perturbation_name: Optional[str]
     cell_type_cl_id: Optional[str]
     cell_type_name: Optional[str]
+    donor_id: Optional[str] = None
     n_cells: int
     
     # Strategy-specific scores
@@ -625,90 +633,74 @@ class CellGroupCandidate(BaseModel):
 
 ### 4.2 Strategy Orchestration
 
+Strategies execute in priority order until the candidate list is filled. This ensures exact or context-specific matches appear before broader ontology or semantic fallbacks.
+
 ```python
-class StrategyOrchestrator:
-    """Orchestrates multiple retrieval strategies."""
+from .direct_match import DirectMatchStrategy
+from .mechanistic_match import MechanisticMatchStrategy
+from .semantic_match import SemanticMatchStrategy
+from .ontology_guided import OntologyGuidedStrategy
+from .donor_context import DonorContextStrategy
+from .tissue_atlas import TissueAtlasStrategy
+
+
+PERTURBATIONAL_STRATEGY_PRIORITY = [
+    DirectMatchStrategy,      # Exact perturbation + cell type
+    MechanisticMatchStrategy, # Same target genes/pathways
+    SemanticMatchStrategy,    # Similar perturbation description
+    OntologyGuidedStrategy,   # Related cell types via CL
+]
+
+OBSERVATIONAL_STRATEGY_PRIORITY = [
+    DonorContextStrategy,     # Same donor, different cell types
+    TissueAtlasStrategy,      # Same tissue, different donors
+    OntologyGuidedStrategy,   # Related cell types via CL
+    SemanticMatchStrategy,    # Similar sample context
+]
+
+
+async def execute_strategy_pipeline(
+    query: StructuredQuery,
+    db: HaystackDatabase,
+    max_results: int = 50,
+) -> list[CellGroupCandidate]:
+    """
+    Execute retrieval strategies in priority order.
     
-    def __init__(self, db: HaystackDatabase):
-        """
-        Initialize orchestrator with all strategies.
-        
-        Args:
-            db: Async database client
-        """
-        self.perturbational_strategies = [
-            DirectMatchStrategy(db),
-            MechanisticMatchStrategy(db),
-            SemanticMatchStrategy(db),
-            OntologyGuidedStrategy(db),
-        ]
-        self.observational_strategies = [
-            DonorContextStrategy(db),
-            TissueAtlasStrategy(db),
-            SemanticMatchStrategy(db),
-            OntologyGuidedStrategy(db),
-        ]
-        self.hybrid_strategies = [
-            DirectMatchStrategy(db),
-            MechanisticMatchStrategy(db),
-            DonorContextStrategy(db),
-            TissueAtlasStrategy(db),
-            SemanticMatchStrategy(db),
-            OntologyGuidedStrategy(db),
-        ]
+    Stops when enough candidates are found or all strategies exhausted.
+    """
+    if query.task_type.value.startswith("perturbation"):
+        strategies = PERTURBATIONAL_STRATEGY_PRIORITY
+    else:
+        strategies = OBSERVATIONAL_STRATEGY_PRIORITY
     
-    async def retrieve_all(
-        self,
-        query: StructuredQuery,
-        max_per_strategy: int = 20,
-    ) -> list[CellGroupCandidate]:
-        """
-        Run all strategies in parallel and combine results.
+    all_candidates = []
+    seen_groups = set()
+    
+    for strategy_cls in strategies:
+        strategy = strategy_cls(db)
         
-        Args:
-            query: Parsed user query
-            max_per_strategy: Max results per strategy
+        candidates = await strategy.retrieve(
+            query=query,
+            max_results=max_results - len(all_candidates),
+            filters={"exclude_groups": seen_groups},
+        )
         
-        Returns:
-            Combined and deduplicated candidates
-        """
-        import asyncio
+        for candidate in candidates:
+            if candidate.group_id not in seen_groups:
+                all_candidates.append(candidate)
+                seen_groups.add(candidate.group_id)
         
-        # Run strategies in parallel
-        if query.task_type in [
-            ICLTaskType.PERTURBATION_NOVEL_CELL_TYPES,
-            ICLTaskType.PERTURBATION_NOVEL_SAMPLES,
-        ]:
-            strategies = self.perturbational_strategies
-        elif query.task_type in [
-            ICLTaskType.CELL_TYPE_IMPUTATION,
-            ICLTaskType.DONOR_EXPRESSION_PREDICTION,
-        ]:
-            strategies = self.observational_strategies
-        else:
-            strategies = self.hybrid_strategies
+        logger.info(
+            f"Strategy {strategy.strategy_name}: "
+            f"found {len(candidates)} candidates, "
+            f"total now {len(all_candidates)}"
+        )
         
-        tasks = [
-            strategy.retrieve(query, max_results=max_per_strategy)
-            for strategy in strategies
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Combine and deduplicate
-        all_candidates = []
-        seen_groups = set()
-        
-        for strategy, result in zip(strategies, results):
-            if isinstance(result, Exception):
-                logger.warning(f"Strategy {strategy.strategy_name} failed: {result}")
-                continue
-            
-            for candidate in result:
-                if candidate.group_id not in seen_groups:
-                    all_candidates.append(candidate)
-                    seen_groups.add(candidate.group_id)
-        
-        return all_candidates
+        if len(all_candidates) >= max_results:
+            break
+    
+    return all_candidates
 ```
 
 ---
@@ -1249,19 +1241,49 @@ def generate_cell_type_query_text(query: StructuredQuery) -> str:
 
 ## 8. Ontology-Guided Strategy
 
-### 8.1 Description
+### 8.1 Overview
 
-Ontology-Guided Strategy uses the Cell Ontology hierarchy to find related cell types. If the exact cell type isn't available, it searches for parent or child cell types in the ontology.
+The Ontology-Guided Strategy finds cells with related cell types when exact matches aren't available. It uses the Cell Ontology (CL) hierarchy to navigate parent, child, and sibling relationships.
 
-### 8.2 Implementation
+**Key updates:**
+- Uses native `CellOntologyService` (no external MCP server)
+- Leverages `ontology_terms` and `ontology_relationships` tables in Cloud SQL
+- Supports bidirectional graph traversal (`is_a`, `part_of`, `develops_from`)
+
+### 8.2 Strategy Implementation
 
 ```python
+# orchestrator/strategies/ontology_guided.py
+"""Ontology-guided cell retrieval strategy for HAYSTACK."""
+
+from typing import Optional
+import logging
+
+from haystack.orchestrator.services.ontology import CellOntologyService
+from haystack.orchestrator.services.database import HaystackDatabase
+from haystack.shared.models.queries import StructuredQuery
+from haystack.shared.models.cells import CellGroupCandidate
+from .base import RetrievalStrategy
+
+logger = logging.getLogger(__name__)
+
+
 class OntologyGuidedStrategy(RetrievalStrategy):
-    """Find cells via Cell Ontology hierarchy."""
+    """Find cells via Cell Ontology hierarchy using native CL tools."""
+    
+    def __init__(self, db: HaystackDatabase):
+        """
+        Initialize strategy with database and ontology service.
+        
+        Args:
+            db: Async database client for cell queries
+        """
+        super().__init__(db)
+        self.ontology_service = CellOntologyService.get_instance()
     
     @property
     def strategy_name(self) -> str:
-        return "ontology"
+        return "ontology_guided"
     
     async def retrieve(
         self,
@@ -1270,155 +1292,297 @@ class OntologyGuidedStrategy(RetrievalStrategy):
         filters: Optional[dict] = None,
     ) -> list[CellGroupCandidate]:
         """
-        Find cell groups with related cell types via ontology.
+        Find cell groups with related cell types via Cell Ontology.
         
         Strategy:
-        1. Get parent cell types (more general)
-        2. Get child cell types (more specific)
-        3. Get sibling cell types (same parent)
-        4. Search for cells of related types with query perturbation
+        1. Get neighbors of the query cell type via CL hierarchy
+        2. Group neighbors by relationship type and distance
+        3. Search for cells of related types with query perturbation/context
+        4. Score by ontology distance (closer = higher score)
+        
+        Args:
+            query: Parsed user query with resolved cell type
+            max_results: Maximum cell groups to return
+            filters: Additional SQL filters
+        
+        Returns:
+            List of cell group candidates with scores and rationale
         """
         if not query.cell_type_cl_id:
+            logger.warning("No cell_type_cl_id in query, cannot use ontology-guided strategy")
             return []
+        
+        logger.info(f"Running ontology-guided retrieval for {query.cell_type_cl_id}")
         
         candidates = []
         
-        # Get related cell types
-        related_types = await self._get_related_cell_types(
-            cl_id=query.cell_type_cl_id,
-            max_distance=2,
+        # Step 1: Get related cell types from ontology
+        neighbors_result = await self.ontology_service.get_neighbors(
+            term_ids=[query.cell_type_cl_id]
         )
         
-        if not related_types:
+        neighbors = neighbors_result.get(query.cell_type_cl_id, [])
+        
+        if not neighbors or isinstance(neighbors, str):
+            logger.info(f"No ontology neighbors found for {query.cell_type_cl_id}")
             return []
         
-        # Search for cells of related types
-        for related_cl_id, distance, relationship in related_types:
-            matches = await self._search_by_cell_type(
-                cell_type_cl_id=related_cl_id,
-                perturbation_name=query.perturbation_resolved,
-                max_results=max_results // len(related_types),
-                exclude_groups={c.group_id for c in candidates},
-            )
+        logger.info(f"Found {len(neighbors)} ontology neighbors")
+        
+        # Step 2: Group neighbors by relationship type
+        grouped = self._group_neighbors_by_type(neighbors)
+        
+        # Step 3: Search for cells by related types (priority order)
+        priority_order = [
+            ("is_a", 1),              # Parent types (most relevant)
+            ("is_a_inverse", 1),       # Child types (still relevant)
+            ("part_of", 2),            # Part-of relationships
+            ("part_of_inverse", 2),
+            ("develops_from", 2),      # Developmental relationships
+            ("develops_from_inverse", 2),
+        ]
+        
+        seen_groups = set()
+        
+        for rel_type, base_distance in priority_order:
+            if rel_type not in grouped:
+                continue
             
-            for match in matches:
-                match.relevance_score = 1.0 / (distance + 1)
-                match.rationale = f"Ontology {relationship}: distance={distance}"
+            rel_neighbors = grouped[rel_type]
+            logger.debug(f"Processing {len(rel_neighbors)} {rel_type} neighbors")
             
-            candidates.extend(matches)
+            # Limit neighbors per relationship type
+            for neighbor in rel_neighbors[:max_results // 3]:
+                # Search for cells with this related cell type
+                matches = await self._search_by_related_cell_type(
+                    related_cl_id=neighbor["term_id"],
+                    query=query,
+                    max_results=max_results // len(priority_order),
+                    exclude_groups=seen_groups,
+                )
+                
+                # Score and annotate matches
+                for match in matches:
+                    # Compute relevance score inversely proportional to distance
+                    match.relevance_score = 1.0 / (base_distance + 1)
+                    match.rationale = (
+                        f"Ontology {rel_type}: {neighbor['name']} "
+                        f"({neighbor['term_id']}, distance={base_distance})"
+                    )
+                    match.strategy = self.strategy_name
+                    seen_groups.add(match.group_id)
+                
+                candidates.extend(matches)
+                
+                # Early exit if we have enough candidates
+                if len(candidates) >= max_results:
+                    break
+            
+            if len(candidates) >= max_results:
+                break
         
-        return candidates
+        # Sort by relevance score (descending)
+        candidates.sort(key=lambda c: c.relevance_score, reverse=True)
+        
+        logger.info(f"Ontology-guided strategy found {len(candidates)} candidates")
+        
+        return candidates[:max_results]
     
-    async def _get_related_cell_types(
+    def _group_neighbors_by_type(
         self,
-        cl_id: str,
-        max_distance: int = 2,
-    ) -> list[tuple[str, int, str]]:
-        """
-        Get related cell types from ontology.
+        neighbors: list[dict],
+    ) -> dict[str, list[dict]]:
+        """Group neighbors by relationship type."""
+        grouped: dict[str, list[dict]] = {}
         
-        Returns:
-            List of (cl_id, distance, relationship_type) tuples
-        """
-        sql = """
-            WITH RECURSIVE related AS (
-                -- Parents (distance 1)
-                SELECT 
-                    UNNEST(parent_cl_ids) as cl_id,
-                    1 as distance,
-                    'parent' as relationship
-                FROM cell_types
-                WHERE cell_type_cl_id = $1
-                
-                UNION
-                
-                -- Children (distance 1)
-                SELECT 
-                    UNNEST(child_cl_ids) as cl_id,
-                    1 as distance,
-                    'child' as relationship
-                FROM cell_types
-                WHERE cell_type_cl_id = $1
-                
-                UNION
-                
-                -- Grandparents/grandchildren (distance 2)
-                SELECT 
-                    UNNEST(ct.parent_cl_ids) as cl_id,
-                    r.distance + 1 as distance,
-                    'ancestor' as relationship
-                FROM related r
-                JOIN cell_types ct ON ct.cell_type_cl_id = r.cl_id
-                WHERE r.distance < $2 AND r.relationship IN ('parent', 'ancestor')
-                
-                UNION
-                
-                SELECT 
-                    UNNEST(ct.child_cl_ids) as cl_id,
-                    r.distance + 1 as distance,
-                    'descendant' as relationship
-                FROM related r
-                JOIN cell_types ct ON ct.cell_type_cl_id = r.cl_id
-                WHERE r.distance < $2 AND r.relationship IN ('child', 'descendant')
-            )
-            SELECT DISTINCT cl_id, MIN(distance) as distance, relationship
-            FROM related
-            WHERE cl_id IN (SELECT cell_type_cl_id FROM cell_types WHERE total_cells > 0)
-            GROUP BY cl_id, relationship
-            ORDER BY distance
-        """
+        for neighbor in neighbors:
+            rel_type = neighbor.get("relationship_type", "unknown")
+            if rel_type not in grouped:
+                grouped[rel_type] = []
+            grouped[rel_type].append(neighbor)
         
-        rows = await self.db.execute_query(sql, (cl_id, max_distance))
-        return [(row["cl_id"], row["distance"], row["relationship"]) for row in rows]
+        return grouped
     
-    async def _search_by_cell_type(
+    async def _search_by_related_cell_type(
         self,
-        cell_type_cl_id: str,
-        perturbation_name: Optional[str],
+        related_cl_id: str,
+        query: StructuredQuery,
         max_results: int,
         exclude_groups: set[str],
     ) -> list[CellGroupCandidate]:
-        """Search for cell groups by cell type."""
-        sql = """
-            SELECT 
-                g.group_id,
-                g.dataset,
-                g.perturbation_name,
-                g.cell_type_cl_id,
-                g.cell_type_name,
-                g.n_cells,
-                g.has_control,
-                g.control_group_id
-            FROM cell_groups g
-            WHERE g.cell_type_cl_id = $1
-              AND ($2::text IS NULL OR g.perturbation_name = $2)
-              AND g.group_id != ALL($3)
-            ORDER BY g.n_cells DESC
-            LIMIT $4
         """
+        Search for cells with a related cell type.
         
-        rows = await self.db.execute_query(
-            sql,
-            (cell_type_cl_id, perturbation_name, list(exclude_groups), max_results)
-        )
+        Args:
+            related_cl_id: Cell Ontology ID of related type
+            query: Original query for context (perturbation, donor, etc.)
+            max_results: Maximum results to return
+            exclude_groups: Group IDs to exclude (already found)
         
-        return [
-            CellGroupCandidate(
+        Returns:
+            List of cell group candidates
+        """
+        # Build SQL query based on task type
+        if query.task_type.value.startswith("perturbation"):
+            # For perturbational tasks: Find related cell type + same perturbation
+            sql = """
+                SELECT 
+                    group_id,
+                    dataset,
+                    perturbation_name,
+                    cell_type_cl_id,
+                    cell_type_name,
+                    n_cells,
+                    has_control
+                FROM cell_groups
+                WHERE cell_type_cl_id = $1
+                  AND perturbation_name = $2
+                  AND group_id != ALL($3)
+                ORDER BY n_cells DESC
+                LIMIT $4
+            """
+            params = (
+                related_cl_id,
+                query.perturbation_resolved,
+                list(exclude_groups),
+                max_results,
+            )
+        else:
+            # For observational tasks: Find related cell type + donor context
+            sql = """
+                SELECT 
+                    group_id,
+                    dataset,
+                    perturbation_name,
+                    cell_type_cl_id,
+                    cell_type_name,
+                    donor_id,
+                    n_cells
+                FROM cell_groups
+                WHERE cell_type_cl_id = $1
+                  AND ($2::text IS NULL OR donor_id = $2)
+                  AND group_id != ALL($3)
+                ORDER BY n_cells DESC
+                LIMIT $4
+            """
+            params = (
+                related_cl_id,
+                query.target_donor_id,
+                list(exclude_groups),
+                max_results,
+            )
+        
+        rows = await self.db.execute_query(sql, params)
+        
+        candidates = []
+        for row in rows:
+            candidates.append(CellGroupCandidate(
                 group_id=row["group_id"],
                 dataset=row["dataset"],
-                perturbation_name=row["perturbation_name"],
                 cell_type_cl_id=row["cell_type_cl_id"],
                 cell_type_name=row["cell_type_name"],
+                perturbation_name=row.get("perturbation_name"),
+                donor_id=row.get("donor_id"),
                 n_cells=row["n_cells"],
-                strategy="ontology",
-                relevance_score=0.0,  # Set by caller
-                rationale="",  # Set by caller
-                has_control=row["has_control"],
-                control_group_id=row["control_group_id"],
-            )
-            for row in rows
-        ]
+                has_control=row.get("has_control", False),
+                relevance_score=0.0,  # Will be set by caller
+                strategy=self.strategy_name,
+            ))
+        
+        return candidates
 ```
+
+### 8.3 Multi-Hop Traversal (Advanced)
+
+For cases where the immediate neighbors don't have matching cells, implement multi-hop traversal:
+
+```python
+async def retrieve_with_multi_hop(
+    self,
+    query: StructuredQuery,
+    max_results: int = 50,
+    max_hops: int = 2,
+) -> list[CellGroupCandidate]:
+    """
+    Find cells via multi-hop ontology traversal.
+    
+    Extends basic retrieval by following the ontology graph
+    up to max_hops steps away from the query cell type.
+    
+    Args:
+        query: Parsed user query
+        max_results: Maximum cell groups to return
+        max_hops: Maximum graph distance to traverse
+    
+    Returns:
+        List of cell group candidates with distance-weighted scores
+    """
+    candidates = []
+    visited_terms = {query.cell_type_cl_id}
+    current_frontier = [query.cell_type_cl_id]
+    
+    for hop in range(1, max_hops + 1):
+        if not current_frontier:
+            break
+        
+        logger.debug(f"Ontology hop {hop}: exploring {len(current_frontier)} terms")
+        
+        # Get neighbors for all terms in frontier
+        neighbors_result = await self.ontology_service.get_neighbors(
+            term_ids=current_frontier
+        )
+        
+        next_frontier = []
+        
+        for term_id in current_frontier:
+            neighbors = neighbors_result.get(term_id, [])
+            if not neighbors or isinstance(neighbors, str):
+                continue
+            
+            for neighbor in neighbors:
+                neighbor_id = neighbor["term_id"]
+                
+                # Skip already visited terms
+                if neighbor_id in visited_terms:
+                    continue
+                
+                visited_terms.add(neighbor_id)
+                next_frontier.append(neighbor_id)
+                
+                # Search for cells with this term
+                matches = await self._search_by_related_cell_type(
+                    related_cl_id=neighbor_id,
+                    query=query,
+                    max_results=max_results // (hop * 2),
+                    exclude_groups={c.group_id for c in candidates},
+                )
+                
+                # Score by hop distance
+                for match in matches:
+                    match.relevance_score = 1.0 / (hop + 1)
+                    match.rationale = (
+                        f"Ontology {hop}-hop via {neighbor['relationship_type']}: "
+                        f"{neighbor['name']} ({neighbor_id})"
+                    )
+                
+                candidates.extend(matches)
+        
+        current_frontier = next_frontier
+        
+        if len(candidates) >= max_results:
+            break
+    
+    candidates.sort(key=lambda c: c.relevance_score, reverse=True)
+    return candidates[:max_results]
+```
+
+### 8.4 Integration with Strategy Pipeline
+
+The ontology-guided retrieval is inserted after semantic similarity for perturbational tasks and after donor/tissue context for observational tasks. See Section 4.2 for the full strategy ordering.
+
+### 8.5 Lineage-Based Text Generation
+
+Cell type embeddings include ontology lineage to improve semantic matching. See Section 3.3 for the updated `generate_cell_type_text` function that calls `CellOntologyService.get_lineage`.
 
 ---
 
@@ -1727,7 +1891,7 @@ async def build_haystack_index(
         # Step 3: Generate text descriptions
         print("Step 3: Generating text descriptions...")
         perturbation_texts = [generate_perturbation_text(m) for m in all_metadata]
-        cell_type_texts = [generate_cell_type_text(m) for m in all_metadata]
+        cell_type_texts = [await generate_cell_type_text(m) for m in all_metadata]
         sample_context_texts = [generate_sample_context_text(m) for m in all_metadata]
         
         # Step 4: Compute text embeddings (batched)

@@ -141,11 +141,76 @@ CREATE TABLE conditions (
 CREATE TABLE cell_types (
     cell_type_cl_id VARCHAR(32) PRIMARY KEY,
     cell_type_name VARCHAR(256) NOT NULL,
-    lineage TEXT[],
+    lineage_cl_ids TEXT[],
+    lineage_names TEXT[],
     datasets_present TEXT[],
     total_cells INT,
     perturbations_present TEXT[]
 );
+
+
+-- =============================================================================
+-- CELL ONTOLOGY TABLES
+-- =============================================================================
+-- These tables store Cell Ontology terms and relationships for semantic search
+-- and graph traversal. Data is pre-computed and loaded from GCS.
+
+-- Ontology terms table with vector embeddings
+CREATE TABLE ontology_terms (
+    id SERIAL PRIMARY KEY,
+    
+    -- Term identifiers
+    term_id VARCHAR(32) NOT NULL,
+    name VARCHAR(512) NOT NULL,
+    definition TEXT,
+    
+    -- Ontology metadata
+    ontology_type VARCHAR(32) NOT NULL DEFAULT 'cell',
+    version VARCHAR(16) NOT NULL,
+    
+    -- Vector embedding for semantic search
+    -- OpenAI text-embedding-3-small produces 1536-dimensional vectors
+    embedding vector(1536),
+    
+    -- Timestamps
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Constraints
+    CONSTRAINT uq_ontology_terms_id_version 
+        UNIQUE (term_id, ontology_type, version)
+);
+
+COMMENT ON TABLE ontology_terms IS 'Cell Ontology terms with embeddings for semantic search';
+COMMENT ON COLUMN ontology_terms.term_id IS 'Cell Ontology ID (e.g., CL:0000057)';
+COMMENT ON COLUMN ontology_terms.embedding IS 'OpenAI text-embedding-3-small vector (1536 dim)';
+COMMENT ON COLUMN ontology_terms.version IS 'Ontology version in YYYY-MM-DD format';
+
+
+-- Ontology relationships table
+CREATE TABLE ontology_relationships (
+    id SERIAL PRIMARY KEY,
+    
+    -- Relationship endpoints
+    subject_term_id VARCHAR(32) NOT NULL,
+    object_term_id VARCHAR(32) NOT NULL,
+    relationship_type VARCHAR(64) NOT NULL,
+    
+    -- Ontology metadata
+    ontology_type VARCHAR(32) NOT NULL DEFAULT 'cell',
+    version VARCHAR(16) NOT NULL,
+    
+    -- Timestamps
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Constraints
+    CONSTRAINT uq_ontology_rels 
+        UNIQUE (subject_term_id, object_term_id, relationship_type, ontology_type, version)
+);
+
+COMMENT ON TABLE ontology_relationships IS 'Cell Ontology relationships (is_a, part_of, develops_from, etc.)';
+COMMENT ON COLUMN ontology_relationships.subject_term_id IS 'Source term ID (child in is_a)';
+COMMENT ON COLUMN ontology_relationships.object_term_id IS 'Target term ID (parent in is_a)';
+COMMENT ON COLUMN ontology_relationships.relationship_type IS 'Relationship type: is_a, part_of, develops_from, etc.)';
 
 -- Synonym table for fuzzy matching
 CREATE TABLE synonyms (
@@ -192,6 +257,8 @@ CREATE INDEX idx_cells_donor ON cells(donor_id);
 CREATE INDEX idx_cells_disease ON cells(disease_mondo_id);
 CREATE INDEX idx_cells_condition ON cells(sample_condition);
 
+CREATE INDEX idx_cell_types_lineage ON cell_types USING GIN(lineage_cl_ids);
+
 -- HNSW vector indexes for similarity search
 CREATE INDEX idx_cells_perturbation_embedding ON cells 
 USING hnsw (perturbation_embedding vector_cosine_ops)
@@ -204,6 +271,36 @@ WITH (m = 16, ef_construction = 64);
 CREATE INDEX idx_cells_sample_context_embedding ON cells 
 USING hnsw (sample_context_embedding vector_cosine_ops)
 WITH (m = 16, ef_construction = 64);
+
+-- =============================================================================
+-- ONTOLOGY INDEXES
+-- =============================================================================
+
+-- Term lookup indexes
+CREATE INDEX idx_ontology_terms_term_id ON ontology_terms(term_id);
+CREATE INDEX idx_ontology_terms_name ON ontology_terms(name);
+CREATE INDEX idx_ontology_terms_name_lower ON ontology_terms(LOWER(name));
+CREATE INDEX idx_ontology_terms_type_version ON ontology_terms(ontology_type, version);
+
+-- HNSW vector index for semantic search
+-- IMPORTANT: Build AFTER loading data for best performance
+CREATE INDEX idx_ontology_terms_embedding ON ontology_terms
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Relationship indexes for graph traversal
+CREATE INDEX idx_ontology_rels_subject ON ontology_relationships(subject_term_id);
+CREATE INDEX idx_ontology_rels_object ON ontology_relationships(object_term_id);
+CREATE INDEX idx_ontology_rels_type ON ontology_relationships(relationship_type);
+CREATE INDEX idx_ontology_rels_version ON ontology_relationships(ontology_type, version);
+
+-- Composite index for efficient neighbor queries
+CREATE INDEX idx_ontology_rels_subject_version ON ontology_relationships(
+    subject_term_id, ontology_type, version
+);
+CREATE INDEX idx_ontology_rels_object_version ON ontology_relationships(
+    object_term_id, ontology_type, version
+);
 
 -- Index on synonym table
 CREATE INDEX idx_synonyms_synonym ON synonyms(synonym);
@@ -218,6 +315,51 @@ CREATE INDEX idx_runs_status ON runs(status);
 CREATE INDEX idx_runs_created ON runs(created_at DESC);
 ```
 
+### 8.2.1 Cell Type Lineage Population
+
+```python
+# scripts/populate_cell_type_lineage.py
+"""Populate cell type lineage from Cell Ontology."""
+
+async def populate_lineage():
+    """Pre-compute and store lineage for all cell types."""
+    from haystack.orchestrator.services.ontology import CellOntologyService
+    from haystack.orchestrator.services.database import HaystackDatabase
+    
+    ontology = CellOntologyService.get_instance()
+    db = HaystackDatabase.get_instance()
+    
+    # Get all distinct cell types
+    cell_types = await db.execute_query(
+        "SELECT DISTINCT cell_type_cl_id FROM cell_types WHERE cell_type_cl_id IS NOT NULL"
+    )
+    
+    for row in cell_types:
+        cl_id = row["cell_type_cl_id"]
+        
+        # Get lineage from ontology
+        lineage_names = await ontology.get_lineage(cl_id, max_depth=5)
+        
+        # Get lineage CL IDs (need to resolve names to IDs)
+        lineage_ids = []
+        for name in lineage_names:
+            results = await ontology.semantic_search([name], k=1, distance_threshold=0.3)
+            if results.get(name) and isinstance(results[name], list):
+                lineage_ids.append(results[name][0]["term_id"])
+        
+        # Update cell_types table
+        await db.execute_query(
+            """
+            UPDATE cell_types 
+            SET lineage_cl_ids = $1, lineage_names = $2
+            WHERE cell_type_cl_id = $3
+            """,
+            (lineage_ids, lineage_names, cl_id)
+        )
+    
+    print(f"Updated lineage for {len(cell_types)} cell types")
+```
+
 ### 8.3 Database Roles
 
 ```sql
@@ -226,6 +368,7 @@ CREATE ROLE haystack_app WITH LOGIN PASSWORD 'secure_password';
 GRANT CONNECT ON DATABASE haystack TO haystack_app;
 GRANT USAGE ON SCHEMA public TO haystack_app;
 GRANT SELECT ON cells, cell_groups, donors, conditions, perturbations, cell_types, synonyms TO haystack_app;
+GRANT SELECT ON ontology_terms, ontology_relationships TO haystack_app;
 GRANT SELECT, INSERT, UPDATE ON runs TO haystack_app;
 GRANT USAGE, SELECT ON SEQUENCE runs_run_id_seq TO haystack_app;
 
@@ -234,6 +377,7 @@ CREATE ROLE haystack_agent WITH LOGIN PASSWORD 'secure_password';
 GRANT CONNECT ON DATABASE haystack TO haystack_agent;
 GRANT USAGE ON SCHEMA public TO haystack_agent;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO haystack_agent;
+GRANT SELECT ON ontology_terms, ontology_relationships TO haystack_agent;
 ALTER ROLE haystack_agent SET statement_timeout = '30s';
 ALTER ROLE haystack_agent SET work_mem = '256MB';
 

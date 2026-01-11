@@ -49,6 +49,25 @@ default:
     cache_max_size: 100
     biorxiv_date_window_days: 365
     include_medrxiv: true
+
+  # Ontology configuration
+  ontology:
+    cell:
+      enabled: true
+      embedding_model: "text-embedding-3-small"
+      embedding_dimension: 1536
+      default_k: 3
+      default_distance_threshold: 0.7
+    
+    ols:
+      base_url: "https://www.ebi.ac.uk/ols4/api"
+      request_timeout: 30
+      max_concurrent_requests: 5
+      retry_attempts: 3
+    
+    gcs:
+      bucket: "haystack-data"
+      prefix: "ontology"
   
   # GCP Batch configuration for STACK inference
   batch:
@@ -84,6 +103,10 @@ default:
 dev:
   debug: true
   log_level: "DEBUG"
+
+  ontology:
+    cell:
+      default_distance_threshold: 0.8  # More lenient in dev
   
   email:
     enabled: false  # Disable emails in development
@@ -114,6 +137,10 @@ prod:
     instance_connection_name: "arc-prod:us-east1:haystack-prod"
     database_name: "haystack"
     user: "haystack_app"
+
+  ontology:
+    ols:
+      max_concurrent_requests: 10
   
   gcs:
     project_id: "arc-prod"

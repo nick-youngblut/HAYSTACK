@@ -32,6 +32,48 @@ async def search_cells_by_perturbation(
 
 
 @tool
+async def search_cells_by_cell_type(
+    cell_type_cl_id: str,
+    dataset: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Search for cells by Cell Ontology ID with optional dataset filters.
+    
+    Args:
+        cell_type_cl_id: Cell Ontology ID (e.g., CL:0000057)
+        dataset: Optional dataset filter (parse_pbmc, openproblems, tabula_sapiens)
+        limit: Maximum results to return
+    
+    Returns:
+        List of cell groups matching criteria
+    """
+    ...
+
+
+@tool
+async def search_cells_by_donor(
+    donor_id: str,
+    cell_type_cl_id: Optional[str] = None,
+    dataset: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Search for cells by donor ID with optional filters.
+    
+    Args:
+        donor_id: Donor identifier (prefixed with dataset)
+        cell_type_cl_id: Optional Cell Ontology ID filter
+        dataset: Optional dataset filter (parse_pbmc, openproblems, tabula_sapiens)
+        limit: Maximum results to return
+    
+    Returns:
+        List of cell groups matching criteria
+    """
+    ...
+
+
+@tool
 async def semantic_search_cells(
     query_text: str,
     search_type: Literal["perturbation", "cell_type", "sample_context"],
@@ -69,6 +111,50 @@ async def find_ontology_related_cells(
     
     Returns:
         List of cell groups with ontology distance
+    """
+    ...
+
+
+@tool
+async def find_donor_cells(
+    donor_id: str,
+    cell_type_cl_id: Optional[str] = None,
+    tissue_uberon_id: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Find cell groups for a specific donor with optional filters.
+    
+    Args:
+        donor_id: Donor identifier (prefixed with dataset)
+        cell_type_cl_id: Optional Cell Ontology ID filter
+        tissue_uberon_id: Optional tissue filter (UBERON ID)
+        limit: Maximum results to return
+    
+    Returns:
+        List of cell groups for the donor
+    """
+    ...
+
+
+@tool
+async def find_reference_cells(
+    cell_type_cl_id: str,
+    tissue_uberon_id: Optional[str] = None,
+    disease_mondo_id: Optional[str] = None,
+    max_results: int = 50,
+) -> list[dict]:
+    """
+    Find reference cell groups for observational tasks.
+    
+    Args:
+        cell_type_cl_id: Target Cell Ontology ID
+        tissue_uberon_id: Optional tissue filter (UBERON ID)
+        disease_mondo_id: Optional disease filter (MONDO ID)
+        max_results: Max results to return
+    
+    Returns:
+        List of reference cell groups with relevance scores
     """
     ...
 

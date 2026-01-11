@@ -162,6 +162,146 @@ async def test_agent_routes_to_tool(mocker):
 
 Optional integration tests should be marked (e.g., `@pytest.mark.integration`) and run with real model keys for end-to-end validation.
 
+### 15.4 Cell Ontology Integration Tests
+
+```python
+# tests/unit/test_query_understanding.py
+
+import pytest
+from unittest.mock import AsyncMock, patch
+
+from haystack.orchestrator.agents.query_understanding import (
+    resolve_cell_type_with_fallback,
+)
+
+
+class TestCellTypeResolution:
+    """Tests for cell type resolution in Query Understanding agent."""
+    
+    @pytest.mark.asyncio
+    async def test_semantic_search_success(self):
+        """Test successful resolution via semantic search."""
+        with patch("haystack.orchestrator.services.ontology.CellOntologyService") as mock:
+            mock.get_instance.return_value.semantic_search = AsyncMock(
+                return_value={
+                    "fibroblast": [
+                        {"term_id": "CL:0000057", "name": "fibroblast", "distance": 0.05}
+                    ]
+                }
+            )
+            
+            result = await resolve_cell_type_with_fallback("fibroblast")
+            
+            assert result["resolved"] is True
+            assert result["term_id"] == "CL:0000057"
+            assert result["method"] == "semantic"
+    
+    @pytest.mark.asyncio
+    async def test_ols_fallback(self):
+        """Test fallback to OLS when semantic search fails."""
+        with patch("haystack.orchestrator.services.ontology.CellOntologyService") as mock:
+            mock.get_instance.return_value.semantic_search = AsyncMock(
+                return_value={"rare cell": "No ontology ID found"}
+            )
+            mock.get_instance.return_value.query_ols = AsyncMock(
+                return_value={
+                    "rare cell": [
+                        {"term_id": "CL:0001234", "name": "rare cell type"}
+                    ]
+                }
+            )
+            
+            result = await resolve_cell_type_with_fallback("rare cell")
+            
+            assert result["resolved"] is True
+            assert result["method"] == "ols"
+    
+    @pytest.mark.asyncio
+    async def test_unresolved_cell_type(self):
+        """Test handling of unresolvable cell type."""
+        with patch("haystack.orchestrator.services.ontology.CellOntologyService") as mock:
+            mock.get_instance.return_value.semantic_search = AsyncMock(
+                return_value={"unknown": "No ontology ID found"}
+            )
+            mock.get_instance.return_value.query_ols = AsyncMock(
+                return_value={"unknown": []}
+            )
+            
+            result = await resolve_cell_type_with_fallback("unknown")
+            
+            assert result["resolved"] is False
+            assert "warning" in result
+```
+
+### 15.5 Ontology-Guided Strategy Tests
+
+```python
+# tests/unit/test_ontology_guided_strategy.py
+
+import pytest
+from unittest.mock import AsyncMock, patch
+
+from haystack.orchestrator.strategies.ontology_guided import OntologyGuidedStrategy
+from haystack.shared.models.queries import StructuredQuery, ICLTaskType
+
+
+class TestOntologyGuidedStrategy:
+    """Tests for ontology-guided retrieval strategy."""
+    
+    @pytest.fixture
+    def mock_db(self):
+        return AsyncMock()
+    
+    @pytest.fixture
+    def strategy(self, mock_db):
+        with patch("haystack.orchestrator.services.ontology.CellOntologyService"):
+            return OntologyGuidedStrategy(mock_db)
+    
+    @pytest.mark.asyncio
+    async def test_returns_empty_without_cl_id(self, strategy):
+        """Strategy returns empty if no cell type CL ID."""
+        query = StructuredQuery(
+            raw_query="test",
+            task_type=ICLTaskType.PERTURBATION_NOVEL_CELL_TYPES,
+            cell_type_query="fibroblast",
+            cell_type_cl_id=None,  # No CL ID
+        )
+        
+        result = await strategy.retrieve(query)
+        
+        assert result == []
+    
+    @pytest.mark.asyncio
+    async def test_uses_parent_types_first(self, strategy, mock_db):
+        """Strategy prioritizes parent types over children."""
+        with patch.object(strategy.ontology_service, "get_neighbors") as mock_neighbors:
+            mock_neighbors.return_value = {
+                "CL:0000057": [
+                    {"term_id": "CL:0000548", "name": "animal cell", "relationship_type": "is_a"},
+                    {"term_id": "CL:0002553", "name": "fibroblast of lung", "relationship_type": "is_a_inverse"},
+                ]
+            }
+            
+            mock_db.execute_query.return_value = [
+                {"group_id": "g1", "dataset": "parse_pbmc", "cell_type_cl_id": "CL:0000548",
+                 "cell_type_name": "animal cell", "perturbation_name": "TGF-beta", "n_cells": 100}
+            ]
+            
+            query = StructuredQuery(
+                raw_query="test",
+                task_type=ICLTaskType.PERTURBATION_NOVEL_CELL_TYPES,
+                cell_type_query="fibroblast",
+                cell_type_cl_id="CL:0000057",
+                perturbation_resolved="TGF-beta",
+            )
+            
+            result = await strategy.retrieve(query, max_results=10)
+            
+            assert len(result) > 0
+            # First result should be from parent type (is_a)
+            assert "is_a" in result[0].rationale
+```
+
 ---
 
 ## Related Specs
