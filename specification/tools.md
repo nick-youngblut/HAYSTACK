@@ -1,5 +1,26 @@
 # Tool Specifications
 
+### 6.0 LangChain Tool Conventions
+
+All tools use the LangChain `@tool` decorator and should be designed to run both in unit tests and inside agents. Prefer async tools for I/O. If a tool needs access to runtime context (config, state, streaming), include a `runtime` parameter and treat it as optional to keep tests simple.
+
+```python
+from langchain_core.tools import tool
+from langchain.tools import ToolRuntime
+
+@tool
+async def resolve_cell_type(
+    query: str,
+    runtime: ToolRuntime | None = None,
+) -> dict:
+    """Resolve a cell type name to CL ID with provenance."""
+    config = (runtime.config or {}) if runtime else {}
+    # Use config for thresholds, collection names, etc.
+    return {"label": "fibroblast", "cl_id": "CL:0000057"}
+```
+
+For tools that stream progress to the UI, emit structured progress events via `runtime.stream_writer` (if present). Failures should raise typed exceptions (see `specification/error-handling.md`) and include enough context to support retries.
+
 ### 6.1 Database Query Tools
 
 ```python
@@ -363,6 +384,13 @@ async def search_literature_evidence(
     ...
 ```
 
+### 6.6 Tool Input/Output Standards
+
+- Inputs should be typed, validated, and described in docstrings to support automatic schema generation.
+- Outputs should be structured dictionaries or Pydantic models where possible; avoid free-form strings except for text-heavy content (e.g., full-text paper markdown).
+- Tools should be deterministic given fixed inputs; any randomness must be explicit and configurable.
+- For heavy I/O or long-running tools, include timeouts and return partial results when safe.
+
 ---
 
 ## Related Specs
@@ -370,3 +398,5 @@ async def search_literature_evidence(
 - `specification/agents.md`
 - `specification/literature-search.md`
 - `specification/biological-database-integration.md`
+- `specification/error-handling.md`
+- `specification/testing.md`
