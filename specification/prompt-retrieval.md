@@ -32,8 +32,9 @@ HAYSTACK must select appropriate "prompt cells" for STACK's in-context learning 
 Given a natural language query (e.g., "How would lung fibroblasts respond to TGF-beta?" or "Impute missing fibroblasts for donor A"), the system must:
 1. Determine the ICL task type (perturbational, observational, hybrid)
 2. Resolve the core biological entities (cell types, perturbations, donors, tissues)
-3. Find the most biologically relevant prompt cells from available data
-4. Handle cases where exact matches don't exist
+3. Optionally enrich context from scientific literature (see `specification/literature-search.md`)
+4. Find the most biologically relevant prompt cells from available data
+5. Handle cases where exact matches don't exist
 
 ### 1.2 Key Design Decisions
 
@@ -1063,6 +1064,17 @@ class MechanisticMatchStrategy(RetrievalStrategy):
             for row in rows
         ]
 ```
+
+### 6.3 Literature Enrichment (Optional)
+
+When target genes or pathways are unknown for a perturbation, the system can
+search scientific literature to discover them:
+
+1. Query PubMed/Semantic Scholar for mechanism studies
+2. Extract mentioned genes and pathways from abstracts
+3. Use extracted information to expand mechanistic search
+
+See `specification/literature-search.md` for implementation details.
 
 ---
 

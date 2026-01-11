@@ -21,6 +21,7 @@
 15. [Testing Strategy](#15-testing-strategy)
 16. [Dependencies](#16-dependencies)
 17. [Future Extensions](#17-future-extensions)
+18. [Literature Search](#18-literature-search)
 
 ---
 
@@ -43,7 +44,8 @@ Traditional STACK usage is open-loop: users manually select prompts, run inferen
 
 - Web-based natural language query interface for perturbational, observational, and hybrid ICL requests
 - Multi-strategy prompt generation leveraging drug-target knowledge, donor context, tissue atlases, and cell ontologies
-- Automated biological grounding evaluation with task-appropriate integer scoring (1-10)
+- Literature-grounded context gathering from PubMed, Semantic Scholar, and bioRxiv/medRxiv
+- Automated biological grounding evaluation with task-appropriate integer scoring (1-10), including literature validation
 - Iterative refinement with configurable stopping criteria
 - Polling-based status updates with email notification on completion
 - Run cancellation at any time during execution
@@ -179,7 +181,12 @@ This design ensures runs survive browser disconnects, Cloud Run scale-downs, and
 │                  │         │  • STACK model   │         │  • Reactome/KEGG │
 │  • Cell metadata │         │  • Batch I/O     │         │  • UniProt       │
 │  • Embeddings    │         │  • Results       │         │  • PubMed        │
-│  • Run history   │         │                  │         │  • SendGrid      │
+│  • Run history   │         │                  │         │  • Semantic Scholar │
+│                  │         │                  │         │  • bioRxiv/medRxiv │
+│                  │         │                  │         │  • CORE API      │
+│                  │         │                  │         │  • Europe PMC    │
+│                  │         │                  │         │  • Unpaywall     │
+│                  │         │                  │         │  • SendGrid      │
 └──────────────────┘         └──────────────────┘         └──────────────────┘
 ```
 
@@ -238,7 +245,7 @@ This design ensures runs survive browser disconnects, Cloud Run scale-downs, and
 │  │    │ 2d. GROUNDING EVALUATION                                        │   │    │
 │  │    │     • Extract DE genes from predictions                         │   │    │
 │  │    │     • Run pathway enrichment (GO, KEGG, Reactome)               │   │    │
-│  │    │     • Check literature support via PubMed                       │   │    │
+│  │    │     • Check literature support via PubMed/Semantic Scholar      │   │    │
 │  │    │     • Compute grounding score (1-10)                            │   │    │
 │  │    │     • Update Cloud SQL: phase = "evaluation", scores            │   │    │
 │  │    └─────────────────────────────────────────────────────────────────┘   │    │
@@ -867,6 +874,7 @@ query_understanding_subagent = create_deep_agent(
         get_pathway_priors_tool,
         get_cell_type_markers_tool,
         search_literature_tool,
+        acquire_full_text_paper_tool,
     ],
     system_prompt=QUERY_UNDERSTANDING_PROMPT,
 )
@@ -899,6 +907,11 @@ You are a biological query understanding agent. Your job is to:
 3. GATHER BIOLOGICAL CONTEXT:
    For PERTURBATIONAL: Drug targets, affected pathways
    For OBSERVATIONAL: Cell type markers, tissue signatures, disease-associated genes
+   
+   When targets or pathways are unclear:
+   - Search literature for mechanism studies and reviews
+   - Extract relevant findings from abstracts or full text
+   - Use evidence to expand expected targets/pathways
 
 Output a StructuredQuery with all resolved information.
 
@@ -969,6 +982,7 @@ grounding_evaluation_subagent = create_deep_agent(
         run_pathway_enrichment_tool,
         check_target_activation_tool,
         search_literature_evidence_tool,
+        acquire_full_text_paper_tool,
         build_gene_network_tool,
         get_cell_type_markers_tool,
         get_tissue_signature_tool,
@@ -989,6 +1003,11 @@ PERTURBATIONAL:
 1. PATHWAY COHERENCE: Do enriched pathways match expected biology?
 2. TARGET ACTIVATION: Are known targets differentially expressed correctly?
 3. LITERATURE SUPPORT: Do predictions have published evidence?
+   - 9-10: Multiple papers directly support predictions with matching direction
+   - 7-8: Some supporting evidence, no contradictions
+   - 5-6: Limited evidence, results plausible based on pathway biology
+   - 3-4: No direct evidence, results speculative
+   - 1-2: Evidence contradicts predictions
 4. NETWORK COHERENCE: Do DE genes form connected functional modules?
 
 OBSERVATIONAL:
@@ -1305,6 +1324,70 @@ class GroundingEvaluator:
         ...
 ```
 
+### 6.5 Literature Search Tools
+
+```python
+@tool
+async def search_literature(
+    query: str,
+    max_results: int = 10,
+    databases: list[str] | None = None,
+) -> str:
+    """
+    Search scientific literature databases for relevant papers.
+    
+    Args:
+        query: Search query (supports standard search syntax)
+        max_results: Maximum results per database
+        databases: Databases to search (pubmed, semantic_scholar, biorxiv)
+        
+    Returns:
+        Formatted list of papers with titles, authors, abstracts
+    """
+    ...
+
+
+@tool
+async def acquire_full_text_paper(
+    doi: str,
+) -> str:
+    """
+    Acquire full-text paper content and convert to markdown.
+    
+    Tries preprint servers, CORE API, Europe PMC, and Unpaywall.
+    Falls back to abstract if full text unavailable.
+    
+    Args:
+        doi: Paper DOI (e.g., "10.1016/j.cell.2024.01.001")
+        
+    Returns:
+        Paper content as markdown
+    """
+    ...
+
+
+@tool
+async def search_literature_evidence(
+    genes: list[str],
+    perturbation: str | None = None,
+    cell_type: str | None = None,
+    max_papers: int = 5,
+) -> str:
+    """
+    Search for literature evidence supporting gene expression patterns.
+    
+    Args:
+        genes: List of gene symbols to search for
+        perturbation: Optional perturbation context
+        cell_type: Optional cell type context
+        max_papers: Maximum papers to return
+        
+    Returns:
+        Evidence summary with citations
+    """
+    ...
+```
+
 ---
 
 ## 7. Biological Database Integration
@@ -1357,6 +1440,23 @@ class BiologicalDatabaseClient:
             )
             response.raise_for_status()
             return response.json()
+
+    # Literature search methods
+    async def search_pubmed(self, query: str, max_results: int = 20) -> list[dict]:
+        """Search PubMed via E-utilities API."""
+        ...
+    
+    async def search_semantic_scholar(self, query: str, max_results: int = 20) -> list[dict]:
+        """Search Semantic Scholar Graph API."""
+        ...
+    
+    async def search_biorxiv(self, query: str, max_results: int = 20) -> list[dict]:
+        """Search bioRxiv/medRxiv API."""
+        ...
+    
+    async def acquire_full_text(self, doi: str) -> dict:
+        """Acquire full-text PDF and convert to markdown."""
+        ...
     
     async def close(self):
         """Close the HTTP client."""
@@ -1371,6 +1471,11 @@ class BiologicalDatabaseClient:
 | Reactome | Pathway analysis | https://reactome.org/ContentService |
 | UniProt | Protein information | https://rest.uniprot.org |
 | PubMed | Literature search | https://eutils.ncbi.nlm.nih.gov |
+| Semantic Scholar | Literature search | https://api.semanticscholar.org |
+| bioRxiv/medRxiv | Preprint search | https://api.biorxiv.org |
+| CORE | Open access full text | https://api.core.ac.uk |
+| Europe PMC | Literature/full text | https://www.ebi.ac.uk/europepmc |
+| Unpaywall | OA availability | https://api.unpaywall.org |
 | Cell Ontology | Cell type hierarchy | Local OBO file |
 | Gene Ontology | GO terms | https://api.geneontology.org |
 
@@ -3116,6 +3221,24 @@ default:
     base_delay_seconds: 1.0
     max_delay_seconds: 30.0
     requests_per_minute: 30
+
+  # Literature search settings
+  literature:
+    max_results_per_database: 20
+    default_databases:
+      - pubmed
+      - semantic_scholar
+      - biorxiv
+    enable_full_text: true
+    max_full_text_chars: 100_000
+    enable_image_descriptions: false
+    requests_per_minute: 30
+    request_timeout_seconds: 30
+    max_retries: 3
+    cache_ttl_seconds: 3600
+    cache_max_size: 100
+    biorxiv_date_window_days: 365
+    include_medrxiv: true
   
   # GCP Batch configuration for STACK inference
   batch:
@@ -3206,6 +3329,10 @@ GOOGLE_API_KEY=...
 
 # Email notifications (SendGrid)
 SENDGRID_API_KEY=SG...
+
+# Literature API credentials
+CORE_API_KEY=
+UNPAYWALL_EMAIL=
 
 # Database (Cloud SQL)
 # Connection handled via Cloud SQL Connector with IAM auth
@@ -4080,6 +4207,8 @@ dependencies = [
     "anndata>=0.10.0",
     "pandas>=2.0.0",
     "numpy>=1.24.0",
+    "docling>=2.60.0",
+    "lxml>=5.0.0",
     
     # API clients
     "httpx>=0.27.0",
@@ -4182,12 +4311,33 @@ A deferred feature that would allow users to pause a running analysis and provid
 - Result streaming with Server-Sent Events (SSE) for active monitoring
 - Warm VM pools to reduce Batch job startup latency
 
-### 17.4 Integration Opportunities
+### 17.4 Advanced Literature Features
+
+- Citation network analysis for discovering related work
+- Automatic paper summarization using LLM
+- Literature-based hypothesis generation
+- Integration with institutional library access for paywalled content
+- Semantic search over indexed paper corpus
+
+### 17.5 Integration Opportunities
 
 - Benchling integration for experimental tracking
 - GEO integration for validation data retrieval
 - Slack notifications for run completion (alternative to email)
 - Asana task creation for failed runs
+
+---
+
+## 18. Literature Search
+
+HAYSTACK integrates scientific literature search to enhance query understanding and grounding evaluation.
+The complete specification is in `specification/literature-search.md`.
+
+Key capabilities:
+- Multi-database search (PubMed, Semantic Scholar, bioRxiv/medRxiv)
+- Full-text PDF acquisition via open-access sources
+- PDF-to-markdown conversion for LLM consumption
+- Evidence extraction for grounding validation
 
 ---
 
