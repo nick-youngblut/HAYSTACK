@@ -405,13 +405,47 @@ async def find_matched_controls(
 
 ---
 
-### Task 5.2: Implement Query-as-Control Baseline
+### Task 5.2: Implement Control Strategy Fallback
 
-- [ ] **5.2.1** Document query-as-control workflow:
+> **Spec Reference**: `./specification/data-models.md` (ControlStrategy), `./INIT-IMP-PLAN.md` (Control Strategy section)
+
+- [ ] **5.2.1** Implement fallback logic:
+
+```python
+async def determine_effective_control_strategy(
+    requested_strategy: ControlStrategy,
+    prompt_candidates: list[PromptCandidate],
+) -> tuple[ControlStrategy, str]:
+    """
+    Determine effective control strategy based on availability.
+    
+    Fallback Order:
+    1. If synthetic_control requested and controls found → synthetic_control
+    2. If synthetic_control requested but no controls → query_as_control (with warning)
+    3. If query_as_control requested → query_as_control
+    """
+    if requested_strategy == ControlStrategy.QUERY_AS_CONTROL:
+        return ControlStrategy.QUERY_AS_CONTROL, "User requested query-as-control"
+    
+    # Check if any candidate has paired controls
+    has_controls = any(c.paired_control_indices for c in prompt_candidates)
+    
+    if has_controls:
+        return ControlStrategy.SYNTHETIC_CONTROL, "Matched controls found"
+    else:
+        return ControlStrategy.QUERY_AS_CONTROL, "Fallback: no matched controls available"
+```
+
+- [ ] **5.2.2** Document query-as-control workflow:
   - Single STACK inference (no paired control)
   - DE computed against original query cells
   - Store `query_cells_gcs_path` in IterationRecord
-  - Apply mild confidence penalty in grounding
+  - Apply mild confidence penalty in grounding scoring
+
+- [ ] **5.2.3** Track control strategy in run record:
+  - `control_strategy`: User's requested strategy
+  - `control_strategy_effective`: Actual strategy used (after fallback)
+  - `control_cells_available`: Boolean indicating if matched controls were found
 
 ---
 

@@ -17,6 +17,19 @@ This sprint implements the agentic AI system:
 - Grounding Evaluation subagent
 - LangChain tools for all operations
 
+**Key Libraries** (per `./specification/dependencies.md`):
+- `langchain>=1.0.0` - Core agent framework
+- `deepagents>=0.1.0` - Agent building utilities
+- `langgraph>=0.1.0` - Multi-agent orchestration
+- `langchain-anthropic`, `langchain-openai`, `langchain-google-genai` - LLM providers
+
+**Agent Initialization Pattern**:
+```python
+from langchain.chat_models import init_chat_model
+
+model = init_chat_model("anthropic:claude-sonnet-4-5-20250929", temperature=0.7)
+```
+
 ---
 
 ## Phase 1: LangChain Tool Definitions
