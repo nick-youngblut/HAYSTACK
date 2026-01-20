@@ -1,5 +1,7 @@
 # Misc
 tmp/
+tasks/
+*.jpeg
 
 
 # Byte-compiled / optimized / DLL files
